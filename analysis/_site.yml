@@ -1,7 +1,7 @@
-name: "asawa-cto-pdac"
+name: CTO-PDAC Project
 output_dir: ../docs
 navbar:
-  title: "asawa-cto-pdac"
+  title: cto-pdac
   left:
   - text: Home
     href: index.html
@@ -9,9 +9,16 @@ navbar:
     href: about.html
   - text: License
     href: license.html
+  right:
+  - icon: fab fa-github
+    text: Source code
+    href: https://github.com/TheAcetoLab/asawa-cto-pdac
 output:
   workflowr::wflow_html:
     toc: yes
     toc_float: yes
     theme: cosmo
     highlight: textmate
+    number_sections: yes
+    code_folding: hide
+    toc_depth: 5
