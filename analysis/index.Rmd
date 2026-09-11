@@ -1,11 +1,37 @@
 ---
-title: "Home"
+title: "Fibroblast-low regions are intravasation hotspots for circulating tumor organoids in pancreatic cancer"
 site: workflowr::wflow_site
-output:
-  workflowr::wflow_html:
-    toc: false
+output: workflowr::wflow_html
 editor_options:
   chunk_output_type: console
 ---
 
-Welcome to my research website.
+## Low-input RNA-seq of CTCs
+
+### PDAC-3 xenograft model
+
+- [Differential expression](pdac3_ctc-rnaseq-deg.html)
+
+### Patient-derived CTC
+
+- [Differential expression](patients_ctc-rnaseq-deg.html)
+- [Somatic variant calling](patients_ctc-rnaseq-varcall.html)
+
+### Integration of PDAC-3 and patient-derived CTCs
+
+- [Integration of PDAC-3 and patient-derived CTCs](pdac3-patient-ctc-rnaseq-integration.html)
+
+
+### Cell type deconvolution
+
+- [Cell type deconvolution across models](integration-rnaseq-deconvolution.Rmd)
+
+- [CAF genes in CD90.1-positive tumor cells sorted from a KPC C57BL/6J primary tumor](kpc_te3-rnaseq-bulk-exploration.html)
+
+
+
+## PDAC-3 : Spatial transcriptomics
+
+-[Barcode groups analysis](pdac3-visium-bc-analysis.Rmd)
+
+-[TME distances]

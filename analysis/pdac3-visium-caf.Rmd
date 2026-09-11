@@ -1,0 +1,711 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "CAF exploration"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: 'PDAC-3'
+  output_dir: ./output/rnaseq-spatial/pdac3/caf
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+---
+
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(knitr)
+library(patchwork)
+library(kableExtra)
+library(ggbeeswarm)
+library(ggpubr)
+library(ggExtra)
+
+library(Seurat)
+library(semla)
+library(SummarizedExperiment)
+library(spacexr)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data wrangling
+
+Load required data
+```{r dw-load-data}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_mm/seurat_merged_semla.rds'))
+seu_hs <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla.rds'))
+```
+
+Add Acta2 expression to Seurat metadata
+```{r dw-add-acta2}
+seu$acta2_mm <- seu[['SCT']]$counts['GRCm39-Acta2',]
+```
+
+Add human ACTA2 expression and combine with mouse Acta2. Cancer cells were co-injected with both mouse and human fibroblast. So, we need to combine both mouse and human Acta2 expression to better capture the CAF areas.
+```{r dw-add-acta2-hs}
+acta2_hs <- seu_hs[['SCT']]$counts['GRCh38-ACTA2',] %>% 
+  data.frame %>% 
+  set_names('acta2_hs') %>% 
+  rownames_to_column('barcodes')
+
+seu[[]] %<>% 
+  rownames_to_column('barcodes') %>% 
+  left_join(acta2_hs, by = 'barcodes') %>% 
+  column_to_rownames('barcodes') %>% 
+  mutate(
+    acta2_hs = ifelse(is.na(acta2_hs), 0, acta2_hs)
+  )
+
+seu$acta2 <- seu$acta2_mm + seu$acta2_hs
+```
+
+Save Acta2 expression
+```{r dw-save-acta2}
+seu[[]] %>% 
+  rownames_to_column('barcode') %>% 
+  select(barcode, acta2_mm, acta2_hs, acta2) %>% 
+  saveRDS(.,file.path(params$output_dir, 'acta2_expression.rds'))
+
+```
+
+
+Add Pdgfra expression to Seurat metadata
+```{r dw-add-pdgfra}
+seu$pdgfra_mm <- seu[['SCT']]$counts['GRCm39-Pdgfra',]
+```
+
+Add human PDGFRA expression and combine with mouse Pdgfra Cancer cells were co-injected with both mouse and human fibroblast. So, we need to combine both mouse and human Pdgfra expression to better capture the CAF areas.
+```{r dw-add-pdgfra-hs}
+pdgfra_hs <- seu_hs[['SCT']]$counts['GRCh38-PDGFRA',] %>% 
+  data.frame %>% 
+  set_names('pdgfra_hs') %>% 
+  rownames_to_column('barcodes')
+
+seu[[]] %<>% 
+  rownames_to_column('barcodes') %>% 
+  left_join(pdgfra_hs, by = 'barcodes') %>% 
+  column_to_rownames('barcodes') %>% 
+  mutate(
+    pdgfra_hs = ifelse(is.na(pdgfra_hs), 0, pdgfra_hs)
+  )
+
+seu$pdgfra <- seu$pdgfra_mm + seu$pdgfra_hs
+```
+
+Save Pdgfra expression
+```{r dw-save-pdgfra}
+seu[[]] %>% 
+  rownames_to_column('barcode') %>% 
+  select(barcode, pdgfra_mm, pdgfra_hs, pdgfra) %>% 
+  saveRDS(.,file.path(params$output_dir, 'pdgfra_expression.rds'))
+
+```
+
+
+
+Add Fap expression to Seurat metadata
+```{r dw-add-fap}
+seu$fap_mm <- seu[['SCT']]$counts['GRCm39-Fap',]
+```
+
+Add human FAP expression and combine with mouse Fap Cancer cells were co-injected with both mouse and human fibroblast. So, we need to combine both mouse and human Fap expression to better capture the CAF areas.
+```{r dw-add-fap-hs}
+fap_hs <- seu_hs[['SCT']]$counts['GRCh38-FAP',] %>% 
+  data.frame %>% 
+  set_names('fap_hs') %>% 
+  rownames_to_column('barcodes')
+
+seu[[]] %<>% 
+  rownames_to_column('barcodes') %>% 
+  left_join(fap_hs, by = 'barcodes') %>% 
+  column_to_rownames('barcodes') %>% 
+  mutate(
+    fap_hs = ifelse(is.na(fap_hs), 0, fap_hs)
+  )
+
+seu$fap <- seu$fap_mm + seu$fap_hs
+```
+
+Save Fap expression
+```{r dw-save-fap}
+seu[[]] %>% 
+  rownames_to_column('barcode') %>% 
+  select(barcode, fap_mm, fap_hs, fap) %>% 
+  saveRDS(.,file.path(params$output_dir, 'fap_expression.rds'))
+
+```
+
+
+
+Define CAF hotspots. We select spots with Acta2 expression ≥ 1 UMI counts and we define hotspots using an adapted version of  [semla::DisconnectRegions](https://ludvigla.github.io/semla/articles/radial_distances.html#disconnect-regions) to detect singleton spots.We use a scaling factor of 1.3 to define proximity, which means that we consider that two spots are in contact if they are within minimum radial distance * 1.3.
+
+```{r dw-define-CAF-hotspots, eval = FALSE}
+dist_scaling_factor <- 1.3
+expression_threshold <- 2
+
+# Get Staffli object
+spatial_data <- GetStaffli(seu)
+
+# Extract coordinates, transformed after image alignment
+use_coords <- spatial_data@meta_data %>% 
+  # we don't use transformed coordinat
+  dplyr::rename(x = pxl_col_in_fullres, y = pxl_row_in_fullres) %>% 
+  dplyr::select(barcode, x, y, sampleID) %>% 
+  as_tibble()
+
+# Select spots with CAF expression
+use_spots <- colnames(seu)[seu$acta2 >= expression_threshold]
+
+disconnected_spot_labels <- DisconnectRegions.sample(use_coords, use_spots, scaling_factor = dist_scaling_factor, verbose = FALSE)
+
+# Add hotspots size to the data
+hotspot_sizes <- disconnected_spot_labels %>% 
+  group_by(hotspot) %>% 
+  summarise(hotspot_size = n())
+disconnected_spot_labels %<>%
+  left_join(hotspot_sizes, by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(hotspot == 'singleton', 1, hotspot_size))
+
+# Save final hotspot definition
+out_file <- paste0('spots_caf_hotspot_', expression_threshold, '.rds')
+saveRDS(disconnected_spot_labels, file.path(params$output_dir, out_file))
+  
+disconnected_spot_labels %>% filter(hotspot != 'singleton') %>% nrow()
+```
+
+Load CAF hotspots
+```{r dw-load-caf-hotspots}
+caf_hotspots <- readRDS(file.path(params$output_dir, "spots_caf_hotspot_2.rds"))
+
+# Annotate Seurat object
+seu@meta.data %<>% 
+  rownames_to_column('rownames') %>% 
+  left_join(caf_hotspots, by = c('rownames' = 'sample_spot')) %>% 
+  dplyr::rename(hotspot_id = hotspot) %>%
+  mutate(
+    caf_hotspot = hotspot_id,
+    caf_hotspot = ifelse(is.na(hotspot_id) , 'Non CAF', caf_hotspot),
+    caf_hotspot = ifelse(!caf_hotspot %in% c('Non CAF', 'singleton'), 'CAF hotspot', caf_hotspot)
+  ) %>% 
+  column_to_rownames('rownames')
+```
+
+Load deconvolution from RCTD using Tabula Muris reference. We load the results from the multi model. We also extract the convergence metrics and the confidence of the cell type assignment for all cell types, as well as the minimum score of the doublet model, which can be used to filter out spots with low confidence in the deconvolution results.
+```{r dw-extract-rctd-fb-results, eval = FALSE}
+rctd_multi <- readRDS(file.path(params$seurat_dir, 'seurat_mm/rctd_multi_tabmuris.rds'))
+# rctd_full <- readRDS(file.path(params$seurat_dir, 'seurat_mm/rctd_full_tabmuris.rds'))
+
+# Extract results from multi
+i <- 1
+rctd_res <- foreach(i = 1:length(rctd_multi@results), .combine = rbind) %do% {
+  res <- rctd_multi@results[[i]]
+  n_ct <- length(res$cell_type_list)
+  data.frame(
+    # Assuming that the pixel order is the same as the one in the originnal spatial data
+    barcode = rep(names(rctd_multi@originalSpatialRNA@nUMI)[i], n_ct),
+    # convergence
+    conv_all = rep(res$conv_all, n_ct),
+    conv_sub = rep(res$conv_sub, n_ct),
+    cell_type = res$cell_type_list,
+    confidence = res$conf_list,
+    # The weights represent cell type proportions. 
+    weight = res$sub_weights,
+    # "min_score" is the likelihood score of the doublet model (two cell types on the pixel)
+    min_score = rep(res$min_score, n_ct)
+  )
+}
+
+# Extract fibroblast weight (this is proportion). Take with caution, not all have confidence and also as the weights are not normalized to sum 1, but they are normalized to sum 1 across the cell types in the reference. So if there are cell types in the reference that are not present in the sample, the weights will be lower than the actual proportions.
+rctd_fibroblast <- data.frame(
+  barcode = names(rctd_multi@originalSpatialRNA@nUMI),
+  fibroblast_w = lapply(rctd_multi@results, function(x) x$all_weights[['fibroblast']]) %>% 
+  unlist
+)
+
+# Add confidence data to rctd_fibroblast
+rctd_fibroblast %<>% 
+  left_join(
+    rctd_res %>% filter(cell_type == 'fibroblast') %>% select(barcode, starts_with('conv'), confidence),
+    by = 'barcode' 
+  ) %>% 
+  mutate(
+    reported = !is.na(conv_all),
+    conv_all = ifelse(is.na(conv_all), FALSE, conv_all),
+    conv_sub = ifelse(is.na(conv_sub), FALSE, conv_sub),
+    confidence = ifelse(is.na(confidence), FALSE, confidence),
+    confident = ifelse(confidence, 'Confident call', 'Not confident call'),
+    fibroblast_call = ifelse(!reported, 'Not reported', NA),
+    fibroblast_call = ifelse(reported & !confidence, 'Low confidence', fibroblast_call),
+    fibroblast_call = ifelse(reported & confidence, 'High confidence', fibroblast_call),
+    fibroblast_call = ifelse(is.na(fibroblast_call), 'Not reported', fibroblast_call),
+    fibroblast_call = factor(fibroblast_call, levels = c('Not reported', 'Low confidence', 'High confidence'))
+  )
+
+saveRDS(rctd_fibroblast, file.path(params$output_dir, 'rctd_multi_tabmuris_fibroblast_results.rds'))
+```
+
+Calculate module score for FB and CAF subtypes. The following genes were not found: *Col2a1, H2-Ea, COL1A3, and HLA-DPB2*. Also, apply classification of spots into CAF subtypes based on the number of genes detected and the signature score. We used a pan-Fibroblast score ≥ 0.3, a signature score of ≥ 0.3, and a minim Acta2 expresison of 2 to classify a spot as positive for a given CAF subtype. Those thresholds come from the analysis done at [CAF subtypes section](#caf-subtypes)
+```{r dw-calculate-CAF-subtype-scores, eval = FALSE}
+library(UCell)
+library(babelgene)
+seu_full <- readRDS(file.path(params$seurat_dir, 'seurat/seurat_merged_semla.rds'))
+seu_full <- JoinLayers(seu_full, assay = 'Spatial')
+
+# CAF subtypes markers
+caf_mk_hs <- list(
+  FB = c('COL1A1', 'COL1A2', 'COL2A1', 
+                    'COL3A1', 'COL1A3', 'COL6A1', 
+                    'COL6A2'),
+  myCAF = c('ACTA2', 'TGFB1', 'TAGLN'),
+  iCAF = c('IL6', 'CXCL12', 'CXCL13', 'CXCL14', 'ACTA2'), # Acta2 low
+  apCAF = c('CD74', 'HLA-DPB1', 'HLA-DPB2', 'HLA-DQA1', 'HLA-DRA', 'HLA-DRB1', 'ACTA2')
+)
+
+# CAF subtypes markers in mouse
+caf_mk_mm <- foreach(i = caf_mk_hs) %do% {
+  orthologs(genes =i, species = "mouse") %>% pull(symbol)
+}
+names(caf_mk_mm) <- names(caf_mk_hs)
+
+# Modify gene list
+caf_mk_hs <- lapply(caf_mk_hs, function(x) paste0('GRCh38-', x))
+caf_mk_mm <- lapply(caf_mk_mm, function(x) paste0('GRCm39-', x))
+caf_mk_merged <- lapply(names(caf_mk_hs), function(x) {
+  c(caf_mk_hs[[x]], caf_mk_mm[[x]])
+})
+names(caf_mk_merged) <- names(caf_mk_hs)
+
+caf_mk <- list(
+  hs = caf_mk_hs,
+  mm = caf_mk_mm,
+  merged = caf_mk_merged
+)
+
+saveRDS(caf_mk, file.path(params$output_dir, 'caf_subtypes_markers.rds'))
+
+# Calculate scores
+seu_mm_ucell <- AddModuleScore_UCell(seu, features = caf_mk_mm, ncores=4, name = "_mm_ucell")
+seu_hs_ucell <- AddModuleScore_UCell(seu_hs, features = caf_mk_hs, ncores=4, name = "_hs_ucell")
+seu_full_ucell <- AddModuleScore_UCell(seu_full, features = caf_mk_merged, ncores=4, name = "_full_ucell")
+
+mm_ucell <- seu_mm_ucell[[]] %>% 
+  select(ends_with('_mm_ucell')) %>%
+  rownames_to_column('barcode')
+
+hs_ucell <- seu_hs_ucell[[]] %>%
+  select(ends_with('_hs_ucell')) %>%
+  rownames_to_column('barcode')
+
+full_ucell <- seu_full_ucell[[]] %>%
+  select(ends_with('_full_ucell')) %>%
+  rownames_to_column('barcode')
+
+ucell_res <- full_join(mm_ucell, hs_ucell, by = 'barcode') %>% 
+  left_join(full_ucell, by = 'barcode')
+
+rm(seu_mm_ucell, seu_hs_ucell, seu_full_ucell)
+# For each marker, check expression and calculate if it
+# use_mk <- intersect(unlist(caf_mk_merged), rownames(seu_full))
+# mat_expr <- seu_full[['SCT']]$counts[use_mk,]
+i <- names(caf_mk_hs)[1]
+caf_mk_hs_ngenes <- foreach(i = names(caf_mk_hs)) %do%{
+  use_mk <- intersect(caf_mk_hs[[i]], rownames(seu_full))
+  res <- colSums(seu_full[['SCT']]$counts[use_mk,] >= 2) %>% 
+    data.frame %>% 
+    set_names(paste0(i, '_hs_ngenes')) %>% 
+    rownames_to_column('barcode')
+  res[[paste0(i, '_hs_pgenes')]] <- res[[paste0(i, '_hs_ngenes')]] / length(use_mk)
+  res
+} %>% 
+  purrr::reduce(left_join, by = 'barcode')
+  
+caf_mk_mm_ngenes <- foreach(i = names(caf_mk_mm)) %do%{
+  use_mk <- intersect(caf_mk_mm[[i]], rownames(seu_full))
+  res <- colSums(seu_full[['SCT']]$counts[use_mk,] >= 2) %>% 
+    data.frame %>% 
+    set_names(paste0(i, '_mm_ngenes')) %>% 
+    rownames_to_column('barcode')
+  res[[paste0(i, '_mm_pgenes')]] <- res[[paste0(i, '_mm_ngenes')]] / length(use_mk)
+  res
+} %>% 
+  purrr::reduce(left_join, by = 'barcode')
+  
+fb_subtypes_data <- ucell_res %>% 
+  left_join(caf_mk_mm_ngenes) %>% 
+  left_join(caf_mk_hs_ngenes)
+
+# Add acta2 expression to the data
+acta2_expression <- readRDS(file.path(params$output_dir, 'acta2_expression.rds'))
+fb_subtypes_data <- fb_subtypes_data %>% 
+  left_join(acta2_expression %>% dplyr::select(barcode, acta2), by = c('barcode')) %>% 
+  mutate(acta2_expressed = acta2 >= 2)
+
+
+for(use_caf_type in names(caf_mk$mm)) {
+  var_ucell <- paste0(use_caf_type, '_mm_ucell')
+  var_n_genes <- paste0(use_caf_type, '_mm_ngenes')
+  out_var <- paste0(use_caf_type, '_spot')
+
+  fb_subtypes_data[[out_var]] <- fb_subtypes_data[[var_ucell]] >= 0.3 & fb_subtypes_data[['FB_mm_ucell']] >= 0.3 & fb_subtypes_data$acta2 >= 1
+  if(use_caf_type == 'FB')
+    fb_subtypes_data[[out_var]] <- fb_subtypes_data[[var_ucell]] >= 0.3 
+}
+
+
+saveRDS(fb_subtypes_data, file.path(params$output_dir, 'ucell_fibroblast_subtypes.rds'))
+
+
+```
+
+Load deconvolution results
+```{r dw-load-rctd-results}
+rctd_fibroblast <- readRDS(file.path(params$output_dir, 'rctd_multi_tabmuris_fibroblast_results.rds'))
+seu[[]] %<>% 
+  rownames_to_column('rownames') %>%
+  left_join(rctd_fibroblast, by = c('rownames' = 'barcode')) %>%
+  column_to_rownames('rownames')
+
+```
+
+
+## Descriptive analysis
+
+Correlation of the proportion of mouse genes detected (X) and the proportion of UMI counts from mouse (Y).
+```{r mm-prop-stats-collective-corr}
+# Plot correlation of both stats
+seu[[]] %>% 
+  ggplot(aes(nFeature_Spatial_mm_prop, nCount_Spatial_mm_prop)) +
+  geom_point(alpha = 0.1, size = 0.2, pch = 16) +
+  geom_smooth(method = 'gam', linewidth = 0.5)
+```
+
+
+Distribution of the proportion of mouse genes detected across all spots. We can see that most spots have a low proportion of mouse genes, and only a few spots have a high proportion of mouse genes.
+```{r mm-prop-stats-collective-density}
+# Plot density
+seu[[]]  %>% 
+  ggplot(aes(nFeature_Spatial_mm_prop)) +
+  geom_density(alpha = 0.5)
+```
+
+
+Correlation of the proportion of mouse genes detected and the proportion of human genes detected. We can see the negative correlation (expected), but also that there are no points with 100% mouse. 
+```{r mm-prop-mm-hs-prop-correlation}
+res <- seu[[]] %>% 
+  ggplot(aes(nFeature_Spatial_mm_prop, nFeature_Spatial_hs_prop)) +
+  geom_point(alpha = 0.6)
+
+ggMarginal(res, type = "histogram", 
+           xparams = list(binwidth = 0.01, fill = "orange"), 
+           yparams = list(binwidth = 0.01, fill = "orange"))
+```
+
+Compare the number of features detected in spots with high mouse proportion (≥70%), or with high human proportion (≥70%). It is hard to find spots with high Mouse proportion
+```{r mm-prop-stats-nfeatures}
+use_data <- seu[[]]  %>% 
+  mutate(
+    specie = ifelse(nFeature_Spatial_mm_prop >= 0.70, 'Mouse', NA),
+    specie = ifelse(nFeature_Spatial_hs_prop >= 0.70, 'Human', specie),
+    nFeature_Spatial = ifelse(specie == 'Mouse', nFeature_Spatial_mm, NA),
+    nFeature_Spatial = ifelse(specie == 'Human', nFeature_Spatial_hs, nFeature_Spatial)
+  ) %>% 
+  filter(!is.na(specie)) 
+
+
+my_comparisons <- list( c("Mouse", "Human"))
+ggviolin(use_data, x = "specie", y = "nFeature_Spatial", fill = "specie",
+         palette = c("#00AFBB", "#E7B800"),
+         add = "boxplot", 
+         add.params = list(fill = "white"),
+        ) +
+  stat_compare_means(comparisons = my_comparisons, size = 5 * 0.353)+ # Add significance levels
+  theme_project
+
+
+
+use_data %>%
+  group_by(specie) %>%
+  summarise(
+    n = n(),
+    Median = median(nFeature_Spatial),
+    IQR = iqr(nFeature_Spatial),
+    Mean = mean(nFeature_Spatial),
+    SD = sd(nFeature_Spatial)
+  ) %>% 
+  kbl(caption = 'Number of features in Mouse and Human hotspots (>70% of features)') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+Compare mouse ratio per each cluster
+```{r mm-prop-clusters-violin, fig.width = 10.5}
+seu[[]]  %>% 
+  ggplot(aes(seurat_clusters, nFeature_Spatial_mm_prop)) +
+  geom_violin(aes(fill = seurat_clusters), alpha = 0.5)
+  # facet_wrap(~sample_alias)
+```
+
+## Explore Acta2 expression
+
+Distribution of the number of spots by Acta2 expression levels. We cap the UMI counts at 20 to better visualize the distribution, and we exclude spots with 0 counts.
+```{r acta2-expression-barplot}
+seu[[]] %>% 
+  filter(acta2 > 0) %>% 
+  mutate(acta2 = ifelse(acta2>20, 20, acta2)) %>% 
+  ggplot(aes(acta2)) +
+  geom_bar() +
+  scale_x_continuous(breaks = c(0, 2, 5, 10, 15, 20)) +
+  scale_y_log10() +
+  geom_text(stat = "count",
+            aes(label = after_stat(count)),
+            vjust = 1.6, color = 'white',
+            size = 1) +
+  labs(
+    x = 'Acta2 UMI counts',
+    y = 'Number of spots',
+    caption = 'UMI counts capped at 20, excluded spots with 0 counts'
+  )
+```
+
+Expression of Acta2 versus the proportion of features from Mouse. We can see that most spots with high Acta2 expression (≥2 UMI) have on average proportion of mouse genes ~20%.
+```{r mm-prop-stats-collective-acta2}
+
+seu[[]] %>% 
+  mutate(acta2 = ifelse(acta2>20, 20, acta2)) %>% 
+  ggplot(aes(acta2, nFeature_Spatial_mm_prop, group = acta2)) +
+  geom_boxplot(outliers = FALSE, linewidth = linewidth_default, notchwidth =2) +
+  geom_vline(xintercept = 2, linetype = 2, linewidth = linewidth_default/2) +
+  # geom_smooth(method = 'lm', linewidth = 0.5) +
+  scale_x_continuous(
+    trans=scales::pseudo_log_trans(base = 2),
+    breaks = c(0, 2, 5, 10, 20)
+  ) +
+  labs(
+    x = "Acta2 normalized counts",
+    caption = 'UMI counts capped at 20'
+  )
+
+```
+
+
+
+## Explore RCTD Fibroblast deconvolution
+
+Fibroblast weight and confidence of the RCTD fibroblast detection We can see that most spots with high confidence in the fibroblast call have a high fibroblast weight, but there are also many spots with low confidence and high fibroblast weight, which could be due to the fact that the confidence is based on the convergence of the deconvolution model, which can be affected by technical factors such as low UMI counts or low number of genes detected, rather than the actual presence of fibroblasts in the spot.
+
+```{r rctd-fb-weight-confidence-violin}
+use_data <- seu[[]]
+my_comparisons <- use_data$fibroblast_call %>% levels %>% combn(2, simplify = FALSE)
+ggviolin(use_data, x = "fibroblast_call", y = "fibroblast_w", fill = "fibroblast_call",
+         palette = c("grey80", "yellow", "firebrick"),
+         add = "boxplot", 
+         add.params = list(fill = "white"),
+        ) +
+  stat_compare_means(comparisons = my_comparisons, size = 5 * 0.353)+ # Add significance levels
+  theme_project +
+  labs(
+    x = "Fibroblast RCTD confidence",
+    y = "Fibroblast weight (proportion)"
+  ) +
+  guides(
+    fill = 'none'
+  ) +
+  theme_facet
+
+```
+
+Distribution of Acta2 expression for each Fibroblast deconvolution category. We can see that most spots with high confidence in the fibroblast call have a high Acta2 expression (≥2 UMI), but there are also many spots with low confidence and high Acta2 expression, which could be due to the fact that the confidence is based on the convergence of the deconvolution model, which can be affected by technical factors such as low UMI counts or low number of genes detected, rather than the actual presence of fibroblasts in the spot.
+```{r rctd-fb-acta2-group-pct}
+seu[[]] %>% 
+  filter(!is.na(fibroblast_call)) %>% 
+   mutate(
+    acta2 = ifelse(acta2>20, 20, acta2)
+  ) %>% 
+  ggplot(aes(acta2)) +
+  geom_bar(aes(y = after_stat(prop))) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~fibroblast_call, ) +
+  theme_facet +
+  scale_x_continuous(
+    breaks = c(0, 2, 5, 10, 20)
+  ) +
+  labs(
+    x = "Acta2 normalized counts",
+    y = "Percentage of spots",
+    caption = 'UMI counts capped at 20'
+  )
+```
+
+Correlation of Acta2 expression and Fibroblast weight from RCTD deconvolution. We can see that most spots with high Acta2 expression (≥2 UMI) have a high fibroblast weight, but there are also many spots with low Acta2 expression and high fibroblast weight, which could be due to the fact that Acta2 is not the only marker of fibroblasts, or that there are some spots with low Acta2 expression that are still classified as fibroblasts by RCTD due to the expression of other markers.
+```{r rctd-fb-acta2-group-fb-weight}
+seu[[]] %>% 
+  filter(!is.na(fibroblast_call)) %>% 
+  mutate(
+    acta2 = ifelse(acta2>20, 20, acta2)
+  ) %>% 
+  ggplot(aes(acta2, fibroblast_w, group = acta2)) +
+  # geom_quasirandom(width = 0.2, 
+  #                  size = 0.5, 
+  #                  alpha = 0.2,
+  #                  pch = 16) +
+  geom_boxplot(outliers = FALSE, 
+               linewidth = linewidth_default, 
+               notchwidth =2, 
+               width = 0.5,
+               fill = NA) +
+  geom_vline(xintercept = 1.5, 
+             linetype = 2, 
+             linewidth = linewidth_default/2) +
+  facet_wrap(~fibroblast_call) +
+  scale_x_continuous(
+    breaks = c(0, 2, 5, 10, 20)
+  ) +
+  labs(
+    x = "Acta2 normalized counts",
+    y = "Fibroblast weight (proportion)",
+    caption = 'UMI counts capped at 20'
+  ) +
+  guides(
+    color = 'none'
+  ) +
+  theme_facet
+```
+
+
+## CAF markers correlation
+
+### Acta2, Pdgfra and Fap correlation
+```{r caf-mk-correlation, fig.asp = 1}
+require("PerformanceAnalytics")
+use_data <- seu[[]] %>% 
+  dplyr::select(acta2, pdgfra, fap)
+chart.Correlation(use_data, 
+                  pch = 16,
+                  cex = 0.5,
+                  col = adjustcolor("black", alpha.f = 0.05))
+```
+
+### Genes correlated with Acta2
+```{r acta2-corr-data, eval = FALSE}
+expr_matrix <- seu[['SCT']]$counts
+gene_x_expr <- expr_matrix['GRCm39-Acta2',]
+expr_matrix <- as.matrix(expr_matrix[rownames(expr_matrix) != 'GRCm39-Acta2', ])
+
+# Pearson correlation
+cor_results <- cor(t(expr_matrix), gene_x_expr, method = "pearson")
+
+cor_df <- data.frame(
+  Gene = gsub("GRCm39-", "", rownames(cor_results)), 
+  cor = cor_results[,1]
+  ) %>% 
+  arrange(desc(cor))
+saveRDS(cor_df, file.path(params$output_dir, 'cor_pearson_acta2.rds'))
+
+# Spearman correlation
+cor_results <- cor(t(expr_matrix), gene_x_expr, method = "spearman")
+
+cor_df <- data.frame(
+  Gene = gsub("GRCm39-", "", rownames(cor_results)), 
+  cor = cor_results[,1]
+  ) %>% 
+  arrange(desc(cor))
+saveRDS(cor_df, file.path(params$output_dir, 'cor_spearman_acta2.rds'))
+```
+
+```{r acta2-corr-data-load}
+cor_df <- readRDS(file.path(params$output_dir, 'cor_spearman_acta2.rds'))
+cor_genes <- cor_df %>% filter(cor >= 0.25) %>% pull(Gene)
+fb_expr_matrix <- seu[['SCT']]$counts
+rownames(fb_expr_matrix) <- gsub("GRCm39-", "", rownames(fb_expr_matrix))
+fb_expr_matrix <- as.matrix(fb_expr_matrix[c('Acta2', cor_genes), ])
+```
+
+
+Table: Genes with correlation ≥ 0.25
+```{r acta2-corr-table}
+# Table removing rownames
+cor_df %>% 
+  filter(cor >= 0.25) %>% 
+  kbl(caption = 'Genes with Pearson correlation ≥ 0.25 with Acta2 expression',
+      row.names = FALSE) %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+Dendrogram of the genes correlated with Acta2. We can see that some of the genes with high correlation with Acta2 are also correlated with each other, which could indicate that they are co-expressed in the same cell type or in the same biological process.
+```{r acta2-corr-dendrogram, fig.width=4.2, fig.asp = 1}
+dist_matrix <- as.dist(1 - cor(t(fb_expr_matrix), method = "spearman"))
+row_hclust <- hclust(dist_matrix, method = "ward.D2")
+row_dend <- as.dendrogram(row_hclust)
+
+library(dendextend)
+row_dend %>%
+   set("labels_cex", 0.5) %>% 
+  set("labels_col", value = get_scater_palette('tableau20'), k=13) %>%
+  set("branches_k_color", value = get_scater_palette('tableau20'), k=13) %>%
+  plot(horiz=TRUE, axes=FALSE)
+```
+
+
+Correlation plot of Acta2 with top-5 correlated genes
+```{r acta2-corr-plot, fig.asp = 1}
+use_genes <- paste0('GRCm39-', c('Acta2', head(cor_df$Gene, 5)))
+expr_matrix <- seu[['SCT']]$counts[use_genes,]
+rownames(expr_matrix) <- gsub("GRCm39-", "", rownames(expr_matrix))
+require(PerformanceAnalytics)
+color_alpha <- adjustcolor("black", alpha.f = 0.01)
+chart.Correlation(t(expr_matrix), histogram=TRUE, pch=19, cex = 0.1, col = color_alpha, method = "spearman")
+```
+
+Correlation plot of Acta2 with top-5 correlated genes (random sampling 5000 spots)
+```{r acta2-corr-plot-sampled, fig.asp = 1}
+use_genes <- paste0('GRCm39-', c('Acta2', head(cor_df$Gene, 5)))
+use_cols <- sample(1:ncol(seu), 5000)
+expr_matrix <- seu[['SCT']]$counts[use_genes,use_cols]
+rownames(expr_matrix) <- gsub("GRCm39-", "", rownames(expr_matrix))
+require(PerformanceAnalytics)
+color_alpha <- adjustcolor("black", alpha.f = 0.03)
+chart.Correlation(t(expr_matrix), histogram=TRUE, pch=19, cex = 0.1, col = color_alpha, method = "spearman")
+```

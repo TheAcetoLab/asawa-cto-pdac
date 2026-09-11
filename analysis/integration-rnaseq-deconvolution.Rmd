@@ -1,0 +1,458 @@
+---
+title: "Cell type analysis using deconvolution"
+subtitle: "Integration of xenografts, syngeneic and patient results"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  deconv_dir_regex: ./output/rnaseq/MODEL/deconvolution
+  se_path_mm: ./data/rnaseq/syngeneic/se_qc.rds,./data/rnaseq/xenografts/se_qc_mm.rds
+  se_path_hs: ./data/rnaseq/patients_zh_h/se_qc.rds,./data/rnaseq/patients_tx/se.rds
+  model: xenografts,syngeneic,patients_zh_h,patients_tx
+---
+<!-- se_path: ./output/rnaseq/syngeneic/se_qc.rds,./output/rnaseq/xenografts/se_qc_mm.rds,./output/rnaseq/patients/se_qc.rds,./output/rnaseq/p28634_o31042_o32050_Tx/summarizedExperiment/se.rds -->
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+# dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(knitr)
+library(ggbeeswarm)
+library(magrittr)
+library(SummarizedExperiment)
+library(edgeR)
+library(scater)
+library(xCell2)
+library(immunedeconv)
+```
+
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+
+## Data wrangling
+
+Process params
+```{r process-params}
+list_models <- str_split(params$model, ',', simplify = FALSE) %>% unlist
+se_mm_list <-  str_split(params$se_path_mm, ',', simplify = FALSE) %>% unlist
+se_hs_list <-  str_split(params$se_path_hs, ',', simplify = FALSE) %>% unlist
+se_list <- c(se_mm_list, se_hs_list)
+```
+
+Run cell type deconvolution using xcell2 TMECompendium (Xenografts and Syngeneic)
+```{r xcell2-deconvolution-mm, eval = FALSE}
+se_file <- se_mm_list[1]
+for(se_file in se_mm_list) {
+  model <- dirname(se_file) %>% basename()
+  out_dir <- gsub('MODEL', model, params$deconv_dir_regex)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  se <- readRDS(se_file)
+  
+  # Normalization
+  norm_method <- "TMM"
+  exprs_mat_for_norm <- assay(se, 'counts')
+  norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+  lib_size <- colSums(exprs_mat_for_norm)/10^6
+  se$size_factor <- (norm_factors * lib_size)
+  se <- logNormCounts(se, size.factors =se$size_factor)
+  se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+
+  
+  mat <- assay(se, 'normcounts')
+  rownames(mat) <- make.names(rowData(se)$gene_name, unique = TRUE)
+  human_mat <- immunedeconv::convert_human_mouse_genes(mat, convert_to = 'human')
+  
+  # TME Compendium
+  data(TMECompendium.xCell2Ref, package = "xCell2")
+  xCell2ref <- TMECompendium.xCell2Ref
+  genes_ref <- getGenesUsed(xCell2ref)
+  genes_mix <- rownames(human_mat)
+  overlap_percentage <- round(length(intersect(genes_mix, genes_ref)) / length(genes_ref) * 100, 2)
+  print(paste0("Overlap between mixture and reference genes is: ", overlap_percentage, "%"))
+  xcell2_results <- xCell2Analysis(
+    mix = human_mat,
+    xcell2object = xCell2ref,
+    minSharedGenes = 0.75 # Allow for a lower overlap threshold
+  )
+  saveRDS(xcell2_results, file.path(out_dir, 'xcell2_TMECompendium_a75.rds'))
+  rm(TMECompendium.xCell2Ref)
+
+}
+```
+
+Run cell type deconvolution using xcell2 TMECompendium (Patients)
+```{r xcell2-deconvolution-hs, eval = FALSE}
+se_file <- se_hs_list[1]
+for(se_file in se_hs_list) {
+  model <- dirname(se_file) %>% basename()
+  out_dir <- gsub('MODEL', model, params$deconv_dir_regex)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  se <- readRDS(se_file)
+  
+  # Normalization
+  norm_method <- "TMM"
+  exprs_mat_for_norm <- assay(se, 'counts')
+  norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+  lib_size <- colSums(exprs_mat_for_norm)/10^6
+  se$size_factor <- (norm_factors * lib_size)
+  se <- logNormCounts(se, size.factors =se$size_factor)
+  se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+
+  
+  mat <- assay(se, 'normcounts')
+  rownames(mat) <- make.names(rowData(se)$gene_name, unique = TRUE)
+  mat <- mat[,colnames(mat) != 'Luz_PDAC_007_10']
+  
+  # TME Compendium
+  data(TMECompendium.xCell2Ref, package = "xCell2")
+  xCell2ref <- TMECompendium.xCell2Ref
+  genes_ref <- getGenesUsed(xCell2ref)
+  genes_mix <- rownames(mat)
+  overlap_percentage <- round(length(intersect(genes_mix, genes_ref)) / length(genes_ref) * 100, 2)
+  print(paste0("Overlap between mixture and reference genes is: ", overlap_percentage, "%"))
+  xcell2_results <- xCell2Analysis(
+    mix = mat,
+    xcell2object = xCell2ref,
+    minSharedGenes = 0.75 # Allow for a lower overlap threshold
+  )
+  saveRDS(xcell2_results, file.path(out_dir, 'xcell2_TMECompendium_a75.rds'))
+  rm(TMECompendium.xCell2Ref)
+
+}
+```
+
+Load sample annotation from SummarizedExperiment objects for each model
+```{r load-se-objects}
+model <- list_models[1]
+sample_annot <- foreach(model = list_models, .combine = rbind) %do% {
+  se_file <- grep(model, se_list, value = TRUE)
+  use_se <- readRDS(se_file)
+  res <- use_se %>% colData %>% data.frame 
+  if(! 'anatomical_origin' %in% colnames(res)) {
+    res$anatomical_origin <- 'blood'
+  }
+  
+  res %>% 
+    select(donor, sample_alias, anatomical_origin, origin:ctc_cluster_id)
+}
+
+
+sample_annot %<>% 
+  mutate(
+    # Re origin names
+    origin = ifelse(origin == 'patient_autopsy', 'patient', origin),
+    # Change sample type
+    sample_type = ifelse(sample_type == 'ctc_cluster_wbc', 'ctc_cluster_heterotypic', sample_type),
+    sample_type = ifelse(sample_type == 'ctc_cluster_heterotypic_dn', 'ctc_cluster_heterotypic', sample_type),
+    sample_type = ifelse(sample_type == 'ctc_cluster_dn', 'ctc_cluster', sample_type),
+    sample_type = ifelse(sample_type == 'cto_wbc', 'cto_heterotypic', sample_type)
+  )
+# Add tumor purity
+sample_annot %<>% 
+  mutate(
+    tumor_purity = ctc_n / (ctc_n + ctc_n_wbc_attached),
+    tumor_purity = ifelse(origin == 'xenograft', 0, tumor_purity)
+  )
+```
+
+Load deconvolution files and process score, normalizing by tumor purity in syngeneic models and patients.
+```{r load-xcell2-files}
+references <- c('TMECompendium')
+list_models <- str_split(params$model, ',', simplify = FALSE) %>% unlist
+
+ref <- references[1]
+model <- list_models[1]
+xcell2_res <- foreach(ref = references) %do% {
+  deconv_res <- foreach(model = list_models, .combine = rbind) %do% {
+    use_file <- file.path(params$deconv_dir_regex, 
+                          paste0('xcell2_',ref,'_a75.rds')) %>% 
+      gsub('MODEL', model, .)
+    if(file.exists(use_file)) {
+      res <- readRDS(use_file)
+      res %>% t() %>% 
+        data.frame(check.names = FALSE) %>% 
+        rownames_to_column('sample_alias') %>% 
+        pivot_longer(-sample_alias, names_to = 'deconv_cell_type', values_to = 'score') %>% 
+        mutate(score = as.numeric(score)) %>% 
+        left_join(sample_annot, by = 'sample_alias')
+    } else {
+      NULL
+    }
+  }
+  
+  
+  deconv_res %<>% 
+    # Remove cell tyes not of interest
+    filter(!sample_type %in% c('dn', 'dn_cell', 'dn_cluster_heterotypic')) %>% 
+    mutate(
+      # Normalize scores
+      score_norm = score / (1-tumor_purity),
+      score_norm = ifelse(score == 0, 0, score_norm),
+      # In cases with Purity == 1, we assign the raw score
+      score_norm = ifelse(tumor_purity == 1, score, score_norm),
+      # Factor sample types
+      sample_type = factor(
+        sample_type,
+        levels = c(
+          'ctc_single',
+          'ctc_single_pool',
+          'ctc_cluster',
+          'ctc_cluster_wbc',
+          'ctc_cluster_heterotypic',
+          'ctc_cluster_heterotypic_dn',
+          'cto',
+          'cto_wbc',
+          'cto_heterotypic',
+          'ctc_cluster_dn',
+          'ctc_gfp'
+        )
+      )
+    )
+  
+  # Set up colors for major cell types
+  major_cell_types <- deconv_res %>% 
+    # filter(score > 0.01) %>% 
+    pull(deconv_cell_type) %>% unique %>% sort
+  
+  res_palette <- get_scater_palette('tableau20')[1:length(major_cell_types)] %>% 
+    set_names(major_cell_types)
+  
+  
+  return(
+    list(      
+      res = deconv_res,
+      palette = res_palette
+    )
+  )
+}
+
+names(xcell2_res) <- references
+```
+
+
+## TMECompendium
+```{r xcell2-TMECompendium-conf}
+reference <- 'TMECompendium'
+use_res <- xcell2_res[[reference]]$res
+
+use_samples <- use_res %>% 
+  pull(sample_alias) %>% unique
+
+use_deconv_cell_type <- use_res %>% 
+  filter(score > 0.01) %>%
+  pull(deconv_cell_type) %>% unique
+
+# Sort levels
+use_palette <- c(
+  `macrophage` = '#7cd0f5',
+  `alternatively activated macrophage` = "#17BECF",
+  `inflammatory macrophage` = "#9EDAE5",
+  `monocyte` = '#1F77B4',
+  `myeloid cell` = "#AEC7E8",
+  `neutrophil` = "#fddc0d",
+  `T cell` = "#2CA02C",
+  `CD8-positive, alpha-beta T cell` = "#98DF8A",
+  `gamma-delta T cell` = "#1ec397",
+  `Non plasma B cell` = "#9467BD",
+  # `B cell` = "#C5B0D5",
+  `B cell` = "#FF7F0E",
+  `natural killer cell` = "#D62728",
+  # `fibroblast` = "#FF7F0E",
+  `fibroblast` = "#C5B0D5",
+  `malignant cell` = 'grey70' ,
+  `other` = 'lightgrey' 
+)
+
+
+# Calculate the score for mieloid cell type
+myeloid_score <- use_res %>% 
+  filter(deconv_cell_type %in% c('macrophage', 'alternatively activated macrophage', 'inflammatory macrophage', 'monocyte', 'myeloid cell')) %>%
+  group_by(sample_alias) %>% 
+  summarise(
+    myeloid_score = sum(score)
+  ) %>% ungroup
+
+use_res <- use_res %>% 
+  filter(sample_alias %in% use_samples) %>% 
+  left_join(myeloid_score) %>% 
+  mutate(
+    deconv_cell_type = ifelse(deconv_cell_type %in% use_deconv_cell_type, deconv_cell_type, 'other'),
+    deconv_cell_type = factor(deconv_cell_type, levels = rev(names(use_palette)))
+    )
+
+
+# Palette
+
+# library(scales)
+# use_palette <- c('#fddc0d', '#7cd0f5', get_scater_palette('tableau20'))
+# show_col(use_palette)
+
+# use_palette <- get_scater_palette('tableau20')[1:length(use_deconv_cell_type)] %>% 
+#   set_names(use_deconv_cell_type)
+# use_palette <- c(use_palette, other = 'lightgrey')
+
+# We remove cell type malignant cells and NA
+use_res %<>% 
+  filter(deconv_cell_type != 'malignant cell') %>% 
+  filter(!is.na(deconv_cell_type))
+```
+
+### Syngeneic
+```{r xcell2-TMECompendium-allograft-conf, fig.width=5.2, fig.asp = 0.9}
+model <- 'allograft'
+```
+
+#### Barplot 
+```{r xcell2-TMECompendium-allograft-barplot, fig.width=5.2, fig.asp = 0.5}
+res_plot <- use_res %>% 
+  filter(origin == model) %>% 
+  filter(sample_type %in% c('ctc_cluster_heterotypic', 'cto_heterotypic')) %>% 
+  mutate(sample_alias = fct_reorder(sample_alias, myeloid_score)) %>% 
+  ggplot(aes(x = sample_alias, y = as.numeric(score), fill = deconv_cell_type)) +
+  geom_col() +
+  # geom_col(position = 'fill') +
+  # geom_bar(stat = 'identity', position = 'fill', color = 'black', size = 0.1) +
+  scale_fill_manual(values = use_palette) +
+  # facet_grid(sample_type~donor, scales = 'free_x', space = 'free') +
+  facet_grid(cols = vars(sample_type, donor), scales = 'free_x', space = 'free') +
+  # facet_wrap(vars(donor), scales = 'free_x') +
+  labs(
+    x = '',
+    y = 'Enrichment score',
+    fill = 'Cell type',
+    # title = 'Cell type composition',
+    caption = 'The score generated by xCell2 is not a percentage, it can be used to compare between samples'
+  )  +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    # axis.text.x = element_text(angle = 90, hjust = 1),
+    strip.text.x = element_text(angle = 90, hjust = 1)
+  ) +
+  theme_facet
+
+print(res_plot)
+cat("\n\n")
+```
+
+
+### Xenograft
+```{r xcell2-TMECompendium-xenograft-conf, fig.width=5.2, fig.asp = 0.9}
+model <- 'xenograft'
+```
+
+#### Barplot 
+```{r xcell2-TMECompendium-xenograft-barplot, fig.width=5.2, fig.asp = 0.5}
+res_plot <- use_res %>% 
+  filter(origin == model) %>% 
+  filter(sample_type %in% c('ctc_cluster_heterotypic', 'cto_heterotypic')) %>% 
+  mutate(sample_alias = fct_reorder(sample_alias, myeloid_score)) %>% 
+  ggplot(aes(x = sample_alias, y = as.numeric(score), fill = deconv_cell_type)) +
+  geom_col() +
+  # geom_col(position = 'fill') +
+  # geom_bar(stat = 'identity', position = 'fill', color = 'black', size = 0.1) +
+  scale_fill_manual(values = use_palette) +
+  # facet_grid(sample_type~donor, scales = 'free_x', space = 'free') +
+  facet_grid(cols = vars(sample_type, donor), scales = 'free_x', space = 'free') +
+  # facet_wrap(vars(donor), scales = 'free_x') +
+  labs(
+    x = '',
+    y = 'Enrichment score',
+    fill = 'Cell type',
+    # title = 'Cell type composition',
+    caption = 'The score generated by xCell2 is not a percentage, it can be used to compare between samples'
+  )  +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    # axis.text.x = element_text(angle = 90, hjust = 1),
+    strip.text.x = element_text(angle = 90, hjust = 1)
+  ) +
+  theme_facet
+
+print(res_plot)
+cat("\n\n")
+```
+
+### Patient
+```{r xcell2-TMECompendium-patient-conf, fig.width=5.2, fig.asp = 0.9}
+model <- 'patient'
+```
+
+#### Barplot 
+```{r xcell2-TMECompendium-patient-barplot, fig.width=5.2, fig.asp = 0.5}
+res_plot <- use_res %>% 
+  filter(origin == model) %>% 
+  mutate(sample_alias = fct_reorder(sample_alias, myeloid_score)) %>% 
+  ggplot(aes(x = sample_alias, y = as.numeric(score), fill = deconv_cell_type)) +
+  geom_col() +
+  # geom_col(position = 'fill') +
+  # geom_bar(stat = 'identity', position = 'fill', color = 'black', size = 0.1) +
+  scale_fill_manual(values = use_palette) +
+  # facet_grid(sample_type~donor, scales = 'free_x', space = 'free') +
+  facet_grid(cols = vars(sample_type, donor), scales = 'free_x', space = 'free') +
+  # facet_wrap(vars(donor), scales = 'free_x') +
+  labs(
+    x = '',
+    y = 'Enrichment score',
+    fill = 'Cell type',
+    # title = 'Cell type composition',
+    caption = 'The score generated by xCell2 is not a percentage, it can be used to compare between samples'
+  )  +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    # axis.text.x = element_text(angle = 90, hjust = 1),
+    strip.text.x = element_text(angle = 90, hjust = 1)
+  ) +
+  theme_facet
+
+print(res_plot)
+cat("\n\n")
+```
+
+
+

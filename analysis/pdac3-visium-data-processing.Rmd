@@ -1,0 +1,1599 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "Raw data processing"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  po_dir: data/rnaseq-spatial/p28248_o36947
+  gex_dir: pipelines/visium_spaceranger
+  bc_dir: pipelines/visium_clonetracker_spaceranger
+  donor: PDAC-3
+  output_dir: ./data/rnaseq-spatial/pdac3
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2023.1.Hs
+---
+
+<!-- ## Load libraries, additional functions and data -->
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+# library(DT)
+library(knitr)
+library(patchwork)
+# library(kableExtra)
+# library(cowplot)
+# # library(colorblindr)
+# library(RColorBrewer)
+# library(ggbeeswarm)
+# library(ggrepel)
+library(magrittr)
+#
+library(Seurat)
+# library(SummarizedExperiment)
+# library(edgeR)
+# library(DESeq2)
+# library(scuttle)
+# library(scran)
+# library(pheatmap)
+# library(PCAtools)
+library(semla)
+library(PRECAST)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Load sample annotation
+```{r load-sample-annotation}
+# Load sample annotation
+sample_annot <- read_csv(
+  file.path(params$po_dir, 'rawdata/samples.csv'), 
+  show_col_types = FALSE) %>%
+  mutate(sample_alias2 = sample_alias) %>%
+  column_to_rownames('sample_alias2')
+
+# Split additional fields
+x <- str_split(sample_annot$additional_fields, ";")
+
+all_add_fields <- foreach(y = x, .combine = c) %do% {
+  res <- str_split(y, "=", simplify = T)
+  res[,1]
+} %>% unique %>% na.omit
+
+add_fields <- foreach(y = x, .combine = rbind) %do% {
+  y_split <- str_split(y, "=", simplify = T)
+  if(ncol(y_split) == 1) {
+    rep(NA, length(all_add_fields)) %>% set_names(all_add_fields)
+  } else {
+    res <- y_split %>%
+      data.frame %>%
+      set_names(c('var', 'value')) %>%
+      full_join(data.frame(var = all_add_fields))
+    res <- res$value %>% set_names(res$var)
+    res[all_add_fields]
+  }
+}
+
+sample_annot <- cbind(sample_annot, add_fields)
+```
+
+Get Ensembl gene info
+```{r ensembl-conf, eval = FALSE}
+library(biomaRt)
+out_dir <- file.path(params$output_dir, 'ensembl')
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+sm <- sample_annot$sample_alias[1]
+spatial_dir <- file.path(file.path(params$po_dir, params$gex_dir), 'spaceranger_count', sm, 'outs')
+x <- Load10X_Spatial(
+  spatial_dir,
+  filename = "filtered_feature_bc_matrix.h5",
+  assay = "Spatial"
+)
+
+
+## Human genes info
+hs_genes <- grep('GRCh38', rownames(x), value = TRUE) %>%  gsub("GRCh38-", "", .)
+ensembl <-  biomaRt::useEnsembl(biomart="genes", dataset="hsapiens_gene_ensembl",
+                                mirror = 'useast')
+gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description', 'chromosome_name', 'gene_biotype'),
+                            filters = 'external_gene_name',
+                            values = hs_genes, 
+                            mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+
+gene_desc <- gene_desc[!duplicated(gene_desc$gene_name),]
+saveRDS(gene_desc, file = file.path(params$output_dir, 'ensembl', 'ensembl_hs.rds'))
+
+## Mouse genes info
+mm_genes <- grep('GRCm39', rownames(x), value = TRUE) %>%  gsub("GRCm39-", "", .)
+ensembl <-  biomaRt::useEnsembl(biomart="genes", dataset="mmusculus_gene_ensembl",
+                                mirror = 'useast')
+gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description', 'chromosome_name', 'gene_biotype'),
+                            filters = 'external_gene_name',
+                            values = mm_genes, 
+                            mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+
+gene_desc <- gene_desc[!duplicated(gene_desc$gene_name),]
+saveRDS(gene_desc, file = file.path(params$output_dir, 'ensembl', 'ensembl_mm.rds'))
+```
+
+Process seurat objects at individual level
+```{r dw-process-spaceranger-individual, eval = FALSE}
+out_dir <- file.path(params$output_dir, 'seurat')
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+ensembl_hs <- readRDS(file.path(params$output_dir, 'ensembl', 'ensembl_hs.rds'))
+ensembl_mm <- readRDS(file.path(params$output_dir, 'ensembl', 'ensembl_mm.rds'))
+ensembl_data <- rbind(ensembl_hs, ensembl_mm)
+ensembl_data <- ensembl_data[!duplicated(ensembl_data$gene_name),]
+
+options(future.globals.maxSize= 891289600)
+
+if(exists('seu_merged'))
+  rm(seu_merged)
+
+sm <- sample_annot$sample_alias[1]
+
+for (sm in sample_annot$sample_alias) {
+  cat(sm , '\n')
+  
+  # Get paths
+  spatial_dir <- file.path(params$po_dir, params$gex_dir, 'spaceranger_count', sm, 'outs')
+  
+  # Slide information
+  slice <- sample_annot[sm, c('sample', 'capture_area', 'tumor_half', 'slice_level', 'slice_consecutive')] %>%
+    paste(., collapse = '_') %>% 
+    gsub(' ', '_', .)
+  
+  # Load data and create Seurat object
+  st0 <- Load10X_Spatial(
+    spatial_dir,
+    filename = "filtered_feature_bc_matrix.h5",
+    assay = "Spatial",
+    slice = slice,
+    bin.size = NULL,
+    filter.matrix = TRUE,
+    to.upper = FALSE,
+    image = NULL
+  )
+  
+  # Change cell names
+  new_spot_names <- paste(sm, colnames(st0), sep = '-')
+  st0 <- RenameCells(st0, new.names = new_spot_names)
+  st0$sample_alias <- sm
+  
+  # Add CloneTracker Barcode counts
+  {
+    # Load BC UMI counts per spot
+    bc_info_file <- file.path(params$po_dir, 
+                              params$bc_dir, 
+                              'bc_umi_counts', 
+                              sm, 
+                              'umi_bc_freq.tsv.txt')
+    bc_info <- read_tsv(bc_info_file, show_col_types = FALSE) %>% 
+      mutate(cell = paste0(cell, "-1"))
+    
+    bc_info$cell <- paste(sm, bc_info$cell, sep = '-')
+    
+    # Init matrix of BC counts
+    bc_mat <- matrix(
+      0, 
+      ncol = ncol(st0),
+      nrow =  unique(bc_info$bc) %>% length(),
+      dimnames = list(unique(bc_info$bc), colnames(st0))
+      ) 
+    
+    # Fill matrix of BC counts
+    bc_info_f <- bc_info %>% filter(cell %in% colnames(st0))
+    for(i in 1:nrow(bc_info_f)) {
+      bc_mat[bc_info_f$bc[i], bc_info_f$cell[i]] <- bc_info_f$umi_counts[i]
+    }
+    bc_mat <- as(bc_mat, "dgCMatrix")
+  }
+  
+  # Create new Seurat object merging GEX data and Barcodes
+  new_counts <- rbind(st0[["Spatial"]]$counts, bc_mat)
+  st1 <- CreateSeuratObject(
+    counts = new_counts, 
+    assay = "Spatial", 
+    meta.data = st0@meta.data,
+    project = sm,
+    min.cells = 0,
+    min.features = 0
+  )
+  st1@images <- st0@images
+  rm(st0)  
+   
+  
+  # Annotate genes
+  st1[['Spatial']]@meta.data <- data.frame(gene_name_sp = rownames(st1)) %>% 
+    mutate(
+      organism = ifelse(grepl('GRCh38', gene_name_sp), 'hs', NA),
+      organism = ifelse(grepl('GRCm39', gene_name_sp), 'mm', organism),
+      organism = ifelse(grepl('^bc', gene_name_sp), 'barcode', organism),
+      gene_name = ifelse(organism == 'hs', gsub("GRCh38-", "", gene_name_sp), gsub("GRCm39-", "", gene_name_sp)),
+      rownames = gene_name_sp
+    ) %>% 
+    left_join(ensembl_data) %>% 
+    column_to_rownames('rownames')
+
+  # Calculate Stats for each spot
+  hs_rows <- st1[['Spatial']]@meta.data$organism == 'hs'
+  mm_rows <- st1[['Spatial']]@meta.data$organism == 'mm'
+  bc_rows <- st1[['Spatial']]@meta.data$organism == 'barcode'
+  mt_rows <- which(st1[['Spatial']]@meta.data$chromosome_name %in% 'MT')
+  
+  st1@meta.data <- st1@meta.data %>% 
+    mutate(
+      nCount_Spatial_hs = colSums(st1[['Spatial']]$counts[hs_rows,]),
+      nFeature_Spatial_hs = colSums(st1[['Spatial']]$counts[hs_rows,] > 0),
+      nCount_Spatial_mm = colSums(st1[['Spatial']]$counts[mm_rows,]),
+      nFeature_Spatial_mm = colSums(st1[['Spatial']]$counts[mm_rows,] > 0),
+      nCount_Spatial_hs_prop = nCount_Spatial_hs/nCount_Spatial,
+      nCount_Spatial_mm_prop = nCount_Spatial_mm/nCount_Spatial,
+      nFeature_Spatial_hs_prop = nFeature_Spatial_hs/nFeature_Spatial,
+      nFeature_Spatial_mm_prop = nFeature_Spatial_mm/nFeature_Spatial,
+      # MT stats
+      nCount_Spatial_mt = colSums(st1[['Spatial']]$counts[mt_rows,]),
+      nCount_Spatial_mt_prop = nCount_Spatial_mt/nCount_Spatial,
+      # BC stats
+      nCount_Spatial_bc = colSums(st1[['Spatial']]$counts[bc_rows,]),
+      nCount_Spatial_bc_prop = nCount_Spatial_bc/nCount_Spatial,
+      nFeature_Spatial_bc = colSums(st1[['Spatial']]$counts[bc_rows,] > 0)
+    )
+  
+  
+  # Remove spots with 0 counts. SCTransform does not work with 0 counts
+  st1 <- st1[, st1$nCount_Spatial > 0]
+  
+  # Data normalization across spots
+  # sctransform normalizes the data, detects high-variance features, and stores the data in the SCT assay.
+  # Genes being expressed in a <2 cells/spots will be excluded.
+  st1 <- SCTransform(st1, assay = "Spatial", verbose = TRUE, min_cells = 2)
+  
+  # Dimensionality reduction and clustering
+  st1 <- RunPCA(st1, assay = "SCT", verbose = FALSE)
+  st1 <- FindNeighbors(st1, reduction = "pca", dims = 1:30)
+  st1 <- FindClusters(st1, verbose = FALSE)
+  st1 <- RunUMAP(st1, reduction = "pca", dims = 1:30)
+  
+  # Identification of Spatially Variable Features
+  # Check othe rmethods in the future (default is "markvariogram")
+  st1 <- FindSpatiallyVariableFeatures(
+    st1, 
+    assay = "SCT", 
+    features = VariableFeatures(st1)[1:1000],
+    selection.method = "moransi")
+  
+  saveRDS(st1, file.path(out_dir, paste0(sm, '.rds')))
+  
+  
+  # Merge Slices
+  if(exists('seu_merged')) {
+    seu_merged <- merge(seu_merged, st1)
+    VariableFeatures(seu_merged) <- c(
+      VariableFeatures(seu_merged), 
+      VariableFeatures(st1)
+      )
+  } else {
+    seu_merged <- st1
+  }
+  
+  # Remove objects
+  rm(st1)
+  
+}
+
+
+# Process merged object
+seu_merged <- RunPCA(seu_merged, verbose = FALSE)
+seu_merged <- FindNeighbors(seu_merged, dims = 1:30)
+seu_merged <- FindClusters(seu_merged, verbose = FALSE)
+seu_merged <- RunUMAP(seu_merged, dims = 1:30)
+
+# Run integration
+# options(future.globals.maxSize= 26000*1024^2) #26Gb
+seu_merged <- IntegrateLayers(
+  object = seu_merged, 
+  method = RPCAIntegration, 
+  normalization.method = "SCT",
+  orig.reduction = "pca",
+  verbose = TRUE)
+
+
+# Run clustering using the integrated reduction
+seu_merged <- FindNeighbors(seu_merged, 
+                            reduction = "integrated.dr", 
+                            dims = 1:30,
+                            graph.name = "integrated.dr.nn")
+
+
+
+# We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. 
+seu_merged <- FindClusters(
+  seu_merged, resolution = 1,
+  graph.name = "integrated.dr.nn",
+  cluster.name = "clusters.dr", 
+  verbose = TRUE)
+
+# Save merged object
+# seu_merged <- readRDS(file.path(out_dir, 'seurat_merged.rds'))
+saveRDS(seu_merged, file.path(out_dir, 'seurat_merged.rds'))
+
+
+# Split object by sample in order to run hotspots definition
+seu_merged_list <- SplitObject(seu_merged, split.by = "sample_alias")
+saveRDS(seu_merged_list, file.path(out_dir, 'seurat_merged_list.rds'))
+
+```
+
+Alignment of slides in 3D space
+```{r dw-align-slides-3d, eval = FALSE}
+seu_merged <- readRDS(file.path(params$output_dir, 'seurat', 'seurat_merged.rds'))
+
+# Slide information
+slide_info <- sample_annot %>% 
+  mutate(
+    slice_info = paste(sample, capture_area, tumor_half, slice_level, slice_consecutive, sep = '_') %>% gsub(' ', '_', .)
+  ) %>% 
+  select(sample_alias, slice_info, sample, capture_area, tumor_half, slice_level, slice_consecutive)
+
+# Save slide info to manually
+write_csv(slide_info, file.path(params$output_dir, 'slide_info.csv'))
+```
+
+```{r dw-align-slides-3d-half1, eval = FALSE}
+# Process tumor half 1 seurat tumor half
+use_samples <- sample_annot %>% filter(tumor_half == '1') %>% pull(sample_alias)
+seu_merged_half <- subset(seu_merged, subset = sample_alias %in% use_samples)
+seu_merged_half <- UpdateSeuratForSemla(seu_merged_half)
+seu_merged_half <- LoadImages(seu_merged_half)
+# Interactive transformation
+# seu_merged_half <- RunAlignment(seu_merged_half)
+# Apply transformations, in a stepwise approach
+# RunAlignment(seu_merged_half)
+transforms <- rbind(
+  generate_rigid_transform(sampleID = 1, tr_x = 0.2682, tr_y = -0.2975, scalefactor = 0.77, angle = -2.69),
+  generate_rigid_transform(sampleID = 2, tr_x = 0.2731, tr_y = -0.285, scalefactor = 0.76, angle = -1.98),
+  
+  generate_rigid_transform(sampleID = 3, tr_x = 0.191, tr_y = -0.19, scalefactor = 0.65),
+  generate_rigid_transform(sampleID = 4, tr_x = -0.10, tr_y = -0.165, scalefactor = 0.59, angle = 172.59),
+  
+  generate_rigid_transform(sampleID = 5, tr_x = 0.1165, tr_y = -0.14, scalefactor = 0.6),
+  generate_rigid_transform(sampleID = 6, tr_x = -0.2907, tr_y = -0.1675, scalefactor = 0.7),
+  
+  generate_rigid_transform(sampleID = 7, tr_x = 0.1595, tr_y = -0.105, scalefactor = 0.50, angle = 4.44),
+  generate_rigid_transform(sampleID = 8, tr_x = -0.2818, tr_y = -0.175, scalefactor = 0.67),
+  
+  generate_rigid_transform(sampleID = 9, tr_x = 0.1063, tr_y = -0.1725, scalefactor = 0.55),
+  generate_rigid_transform(sampleID = 10, tr_x = -0.1902, tr_y = -0.0375, scalefactor = 0.44),
+  generate_rigid_transform(sampleID = 11, tr_x = -0.1797, tr_y = -0.30, scalefactor = 0.41),
+  
+  generate_rigid_transform(sampleID = 12, tr_x = 0.152, tr_y = -0.145, scalefactor = 0.69, angle = 7.52),
+  generate_rigid_transform(sampleID = 13, tr_x = -0.2098, tr_y = -0.0225, scalefactor = 0.44),
+  generate_rigid_transform(sampleID = 14, tr_x = -0.1813, tr_y = -0.3125, scalefactor = 0.44, angle = -3.48),
+  
+  generate_rigid_transform(sampleID = 15, tr_x = 0.085, tr_y = -0.1425, scalefactor = 0.48),
+  generate_rigid_transform(sampleID = 16, tr_x = 0.1101, tr_y = -0.285, scalefactor = 0.49),
+  generate_rigid_transform(sampleID = 17, tr_x = -0.2066, tr_y = -0.2125, scalefactor = 0.41),
+
+  generate_rigid_transform(sampleID = 18, tr_x = 0.0721, tr_y = -0.2175, scalefactor = 0.44, angle = -180),
+  generate_rigid_transform(sampleID = 19, tr_x = 0.20, tr_y = -0.2275, scalefactor = 0.43, angle = -180),
+
+  generate_rigid_transform(sampleID = 20, tr_x = -0.0575, tr_y = -0.2075, scalefactor = 0.43, angle = -180)
+)
+# seu_merged_half <- RigidTransformImages(seu_merged_half, transforms = transforms, verbose = TRUE) 
+# seu_merged_half@tools$Staffli@rasterlists$raw <- seu_merged_half@tools$Staffli@rasterlists$transformed
+# seu_merged_half@tools$Staffli@rasterlists$transformed <- NULL
+# seu_merged_half@tools$Staffli@meta_data <- seu_merged_half@tools$Staffli@meta_data |> 
+#   select(-pxl_col_in_fullres, -pxl_row_in_fullres) |> 
+#   rename(pxl_col_in_fullres = pxl_col_in_fullres_transformed, pxl_row_in_fullres = pxl_row_in_fullres_transformed)
+# ImagePlot(seu_merged_half, mar = c(0, 0, 0, 0), ncol = 5)
+# RunAlignment(seu_merged_half)
+
+transforms_1 <- transforms
+seu_merged_tr1 <- seu_merged_half
+rm(seu_merged_half)
+```
+
+```{r dw-align-slides-3d-half2, eval = FALSE}
+# Process tumor half 2 seurat tumor half
+use_samples <- sample_annot %>% filter(tumor_half == '2') %>% pull(sample_alias)
+seu_merged_half <- subset(seu_merged, subset = sample_alias %in% use_samples)
+seu_merged_half <- UpdateSeuratForSemla(seu_merged_half)
+seu_merged_half <- LoadImages(seu_merged_half)
+ImagePlot(seu_merged_half, mar = c(0, 0, 0, 0), ncol = 5)
+
+transforms <- rbind(
+  generate_rigid_transform(sampleID = 5, tr_x = 0.0776, tr_y = -0.0725, scalefactor = 0.62, angle = 1.94),
+  generate_rigid_transform(sampleID = 6, tr_x = -0.2691, tr_y = -0.05, scalefactor = 0.57),
+  
+  generate_rigid_transform(sampleID = 7, tr_x = 0.1189, tr_y = -0.025, scalefactor = 0.58, angle = 14.29),
+  generate_rigid_transform(sampleID = 8, tr_x = -0.1571, tr_y = -0.04, scalefactor = 0.52),
+  
+  generate_rigid_transform(sampleID = 9, tr_x = 0.0849, tr_y = -0.045, scalefactor = 0.59),
+  generate_rigid_transform(sampleID = 10, tr_x = -0.2422, tr_y = -0.04, scalefactor = 0.53),
+  
+  generate_rigid_transform(sampleID = 11, tr_x = -0.0456, tr_y = -0.1425, scalefactor = 0.4, angle = -82.6),
+  generate_rigid_transform(sampleID = 12, tr_x = -0.0498, tr_y = 0.1475, scalefactor = 0.49, angle = -95.99),
+
+  generate_rigid_transform(sampleID = 13, tr_x = -0.0772, tr_y = -0.18, scalefactor = 0.52, angle = -88.96),
+  generate_rigid_transform(sampleID = 14, tr_x = -0.1028, tr_y = 0.135, scalefactor = 0.50, angle = -91),
+
+  generate_rigid_transform(sampleID = 15, tr_x = -0.0935, tr_y = -0.1375, scalefactor = 0.45, angle = -88.18),
+  generate_rigid_transform(sampleID = 16, tr_x = -0.1035, tr_y = 0.115, scalefactor = 0.47, angle = -96.1),
+
+  generate_rigid_transform(sampleID = 17, tr_x = -0.1263, tr_y = -0.1125, scalefactor = 0.55, angle = -91.71),
+  generate_rigid_transform(sampleID = 18, tr_x = -0.078, tr_y = 0.12, scalefactor = 0.46, angle = -106.92),
+
+  generate_rigid_transform(sampleID = 19, tr_x = -0.1912, tr_y = -0.0175, scalefactor = 0.53, angle = -178.64),
+  generate_rigid_transform(sampleID = 20, tr_x = 0.034, tr_y = 0.08, scalefactor = 0.44, angle = -169.55),
+
+  generate_rigid_transform(sampleID = 1, tr_x = -0.1495, tr_y = 0.05, scalefactor = 0.46, angle = 179.9),
+  generate_rigid_transform(sampleID = 2, tr_x = 0.2105, tr_y = 0.0825, scalefactor = 0.66, angle = -178.14),
+
+  generate_rigid_transform(sampleID = 3, tr_x = 0.0625, tr_y = 0.07, scalefactor = 0.42),
+  generate_rigid_transform(sampleID = 4, tr_x = 0.075, tr_y = 0.0725, scalefactor = 0.46)
+)
+# seu_merged_half <- RunAlignment(seu_merged_half)
+# Apply transformations, in a stepwise approach
+# seu_merged_half <- RigidTransformImages(seu_merged_half, transforms = transforms, verbose = TRUE) 
+# seu_merged_half@tools$Staffli@rasterlists$raw <- seu_merged_half@tools$Staffli@rasterlists$transformed
+# seu_merged_half@tools$Staffli@rasterlists$transformed <- NULL
+# seu_merged_half@tools$Staffli@meta_data <- seu_merged_half@tools$Staffli@meta_data |> 
+#   select(-pxl_col_in_fullres, -pxl_row_in_fullres) |> 
+#   rename(pxl_col_in_fullres = pxl_col_in_fullres_transformed, pxl_row_in_fullres = pxl_row_in_fullres_transformed)
+
+# ImagePlot(seu_merged_half, mar = c(0, 0, 0, 0), ncol = 5)
+# RunAlignment(seu_merged_half)
+
+transforms_2 <- transforms
+seu_merged_tr2 <- seu_merged_half
+rm(seu_merged_half)
+
+
+```
+
+```{r dw-align-slides-3d-merge-transformation, eval = FALSE}
+# Change sampleID from transformation of half 1 and half 2 to match the sampleID in merged object
+images_merged <- data.frame(
+  image = seu_merged@images %>% names, 
+  sampleID_merged = 1:length(seu_merged@images)
+  )
+
+images_half_1 <- data.frame(
+  image = seu_merged_tr1@images %>% names, 
+  sampleID = 1:length(seu_merged_tr1@images)
+  ) %>% 
+  left_join(images_merged)
+
+transforms_1_m <- transforms_1 %>% 
+  left_join(images_half_1) %>% 
+  mutate(sampleID = sampleID_merged) %>% 
+  select(-sampleID_merged, -image)
+
+images_half_2 <- data.frame(
+  image = seu_merged_tr2@images %>% names, 
+  sampleID = 1:length(seu_merged_tr2@images)
+  ) %>% 
+  left_join(images_merged)
+
+transforms_2_m <- transforms_2 %>% 
+  left_join(images_half_2) %>% 
+  mutate(sampleID = sampleID_merged) %>% 
+  select(-sampleID_merged, -image)
+
+rigid_transform <- rbind(transforms_1_m, transforms_2_m) %>% 
+  arrange(sampleID)
+
+saveRDS(rigid_transform, file.path(file.path(params$output_dir, 'seurat', 'rigid_transform.rds')))
+```
+
+Convert seurat to semla, apply 3D transformation and add z-coordinates
+```{r dw-align-slides-3d-merge-transformed, eval = FALSE}
+out_dir <- file.path(params$output_dir, 'seurat')
+seu_merged <- readRDS(file.path(out_dir, 'seurat_merged.rds'))
+rigid_transform <- readRDS(file.path(file.path(params$output_dir, 'seurat', 'rigid_transform.rds')))
+                           
+# Generate semla object from seurat_merged, and apply rigid transformation
+seu_merged_semla <- UpdateSeuratForSemla(seu_merged)
+seu_merged_semla <- LoadImages(seu_merged_semla)
+seu_merged_semla <- RigidTransformImages(seu_merged_semla, transforms = rigid_transform, verbose = TRUE) 
+# seu_merged_semla@tools$Staffli@rasterlists$raw <- seu_merged_semla@tools$Staffli@rasterlists$transformed
+# seu_merged_semla@tools$Staffli@rasterlists$transformed <- NULL
+# seu_merged_semla@tools$Staffli@meta_data <- seu_merged_semla@tools$Staffli@meta_data |> +
+#   select(-pxl_col_in_fullres, -pxl_row_in_fullres) |> 
+#   rename(pxl_col_in_fullres = pxl_col_in_fullres_transformed, pxl_row_in_fullres = pxl_row_in_fullres_transformed)
+
+# Add z-coordinate from slide information
+z_coord <- read_csv('./external/spatial_tx_annotation/pdac3_st_z_coordinates.csv', comment = "#") %>% select(sample_alias, z_um)
+seu_merged_semla@meta.data %<>% 
+  rownames_to_column('rowname') %>% 
+  left_join(z_coord) %>% 
+  column_to_rownames('rowname')
+
+# Save aligned object
+saveRDS(seu_merged_semla, file.path(out_dir, 'seurat_merged_semla.rds'))
+```
+
+Human: Process seurat objects at individual level
+```{r dw-process-seurat-individuals-hs, eval = FALSE}
+in_dir <- file.path(params$output_dir, 'seurat')
+out_dir <- file.path(params$output_dir, 'seurat_hs')
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+if(exists('seu_merged'))
+  rm(seu_merged)
+
+slides_id <- sample_annot$sample_alias
+
+sid <- slides_id[2]
+for(sid in slides_id){
+  # sid <- gsub("\\.", "-", sido)
+  cat('Processing slide', sid, '\n')
+  
+  use_seurat <- readRDS(file.path(in_dir, paste0(sid, '.rds')))
+  use_rows <- use_seurat@assays$Spatial@meta.data %>% filter(organism == 'hs')
+  res_seurat <- subset(use_seurat, features = rownames(use_rows))
+  
+  # Add Barcodes to seurat using misc slot
+  use_rows <- use_seurat@assays$Spatial@meta.data %>% filter(organism == 'barcode')
+  bc_seurat <- subset(use_seurat, features = rownames(use_rows))
+  res_seurat@misc$bc_seurat <- bc_seurat
+  
+  # Remove spots with 0 counts. SCTransform does not work with 0 counts
+  res_seurat <- res_seurat[, res_seurat$nCount_Spatial_hs > 0]
+  
+  # Data normalization across spots
+  # sctransform normalizes the data, detects high-variance features, and stores the data in the SCT assay.
+  # Genes being expressed in a < 2 cells/spots will be excluded.
+  res_seurat <- SCTransform(res_seurat, assay = "Spatial", verbose = TRUE, min_cells = 2)
+  
+  # Dimensionality reduction and clustering
+  # res_seurat <- RunPCA(res_seurat, assay = "SCT", verbose = FALSE)
+  # res_seurat <- FindNeighbors(res_seurat, reduction = "pca", dims = 1:30)
+  # res_seurat <- FindClusters(res_seurat, verbose = FALSE)
+  # res_seurat <- RunUMAP(res_seurat, reduction = "pca", dims = 1:30)
+  
+  # Identification of Spatially Variable Features
+  # Check other methods in the future (default is "markvariogram")
+  res_seurat <- FindSpatiallyVariableFeatures(
+    res_seurat, 
+    assay = "SCT", 
+    features = VariableFeatures(res_seurat)[1:1000],
+    selection.method = "moransi")
+  
+  saveRDS(res_seurat, file.path(out_dir, paste0(sid, '.rds')))
+  
+  # Merge Slices
+  if(exists('seu_merged')) {
+    seu_merged <- merge(seu_merged, res_seurat)
+    VariableFeatures(seu_merged) <- c(
+      VariableFeatures(seu_merged), 
+      VariableFeatures(res_seurat)
+      )
+  } else {
+    seu_merged <- res_seurat
+  }
+  # Remove objects
+  rm(res_seurat)
+  
+}
+
+# Process merged object
+seu_merged <- RunPCA(seu_merged, verbose = FALSE)
+seu_merged <- FindNeighbors(seu_merged, dims = 1:30)
+seu_merged <- FindClusters(seu_merged, verbose = FALSE)
+seu_merged <- RunUMAP(seu_merged, dims = 1:30)
+
+# Run integration
+# options(future.globals.maxSize= 26000*1024^2) #26Gb
+seu_merged <- IntegrateLayers(
+  object = seu_merged, 
+  method = RPCAIntegration, 
+  normalization.method = "SCT",
+  orig.reduction = "pca",
+  verbose = TRUE)
+
+# Run clustering using the integrated reduction
+seu_merged <- FindNeighbors(seu_merged, reduction = "integrated.dr", dims = 1:30)
+# We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. 
+seu_merged <- FindClusters(seu_merged, resolution = 1, cluster.name = "clusters.dr", verbose = TRUE)
+
+# Save merged object
+# seu_merged <- readRDS(file.path(out_dir, 'seurat_merged.rds'))
+saveRDS(seu_merged, file.path(out_dir, 'seurat_merged.rds'))
+
+# Convert to semla and apply the 3D transformations
+rigid_transform <- readRDS(file.path(file.path(params$output_dir, 'seurat', 'rigid_transform.rds')))
+                           
+# Generate semla object from seurat_merged, and apply rigid transformation
+seu_merged_semla <- UpdateSeuratForSemla(seu_merged)
+seu_merged_semla <- LoadImages(seu_merged_semla)
+seu_merged_semla <- RigidTransformImages(seu_merged_semla, transforms = rigid_transform, verbose = TRUE) 
+
+# Add z-coordinate from slide information
+z_coord <- read_csv('./external/spatial_tx_annotation/pdac3_st_z_coordinates.csv', comment = "#") %>% select(sample_alias, z_um)
+seu_merged_semla@meta.data %<>% 
+  rownames_to_column('rowname') %>% 
+  left_join(z_coord) %>% 
+  column_to_rownames('rowname')
+
+# Save semla object
+saveRDS(seu_merged_semla, file.path(out_dir, 'seurat_merged_semla.rds'))
+```
+
+Human: Integration of data considering spatial information (PRECAST) for human data
+```{r dw-integration-precast-hs, eval = FALSE}
+out_dir <- file.path(params$output_dir, 'seurat_hs')
+seu_merged <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+## Extract transformed coordinates
+use_coords <- GetCoordinates(seu_merged) %>% 
+  select(barcode, pxl_col_in_fullres_transformed, pxl_row_in_fullres_transformed) %>% 
+  rename(
+    col = pxl_col_in_fullres_transformed,
+    row = pxl_row_in_fullres_transformed
+  )
+
+## Create a list of Seurat objects, adding row and col coordiantes to metadata
+### I am using corrected and normalized coordinates after slide alignments
+slides_id <- sample_annot$sample_alias
+sid <- slides_id[2]
+seuList <- foreach(sid = slides_id) %do% {
+  x <- readRDS(file.path(out_dir, paste0(sid, '.rds')))
+  x@meta.data %<>% 
+    rownames_to_column('barcode') %>% 
+    left_join(use_coords, by = c('barcode')) %>%
+    mutate(
+      orig.ident = sample_alias
+    ) %>% 
+    column_to_rownames('barcode')
+  x
+}
+
+## Create a PRECASTObject object
+### The gene list used for PRECAST model fitting will be the top variable list as defined by nnSVG
+### Similar strategy than in : https://pmc.ncbi.nlm.nih.gov/articles/PMC11071618/#S11
+### https://github.com/LieberInstitute/spatial_hpc/blob/main/code/06_clustering/PRECAST/03_add_PRECAST_to_spe.R
+use_var_features <- seu_merged[['SCT']]@var.features
+PRECASTObj <- CreatePRECASTObject(
+  seuList, 
+  project = "PRECAST", 
+  customGenelist = use_var_features)
+
+
+
+## Add adjacency matrix list for a PRECASTObj object to prepare for PRECAST model fitting.
+PRECASTObj <- AddAdjList(PRECASTObj, platform = "Visium")
+## Add a model setting in advance for a PRECASTObj object. verbose =TRUE helps outputing the
+## information in the algorithm.
+PRECASTObj <- AddParSetting(PRECASTObj, Sigma_equal = FALSE, verbose = TRUE, maxIter = 3)
+## Fit PRECAST 
+### Use K using a range given by louvain clsuters in integrated data as a guide
+
+n_clusters <- c(
+  as.numeric(as.character(seu_merged$SCT_snn_res.0.8)) %>% max,
+  as.numeric(as.character(seu_merged$clusters.dr)) %>% max
+)
+
+k_range <- seq(min(n_clusters) - 3,min(n_clusters) + 3)
+
+
+PRECASTObj <- PRECAST(PRECASTObj, K = k_range)
+saveRDS(PRECASTObj, file = file.path(out_dir, 'PRECASTObj_multiK.rds'))
+PRECASTObj <- readRDS(file.path(out_dir, 'PRECASTObj_multiK.rds'))
+
+###Select a best model if 𝐾 is an integer vector. Even if 𝐾 is a scalar, this step is also neccessary to re-organize the results in PRECASTObj object.
+### backup the fitting results in resList
+resList <- PRECASTObj@resList
+PRECASTObj <- SelectModel(PRECASTObj)
+
+## Integrate the samples. For computational efficiency, this function exclusively integrates the variable genes. 
+# print(PRECASTObj@seuList)
+seuInt <- IntegrateSpaData(PRECASTObj, species = "Human")
+
+# Find number of barcodes that are different from spe
+# 
+# length(setdiff(colnames(seu_merged), rownames(seuInt@meta.data)))
+
+k_tab <- data.frame(
+    precast_clusters = seuInt@meta.data$cluster,
+    barcodes = rownames(seuInt@meta.data)
+)
+
+seu_merged@meta.data %<>% 
+  rownames_to_column('rowname') %>%
+  left_join(k_tab, by = c('rowname' = 'barcodes')) %>% 
+  column_to_rownames('rowname')
+
+saveRDS(seu_merged, file.path(out_dir, 'seurat_merged_semla.rds'))
+```
+
+Mouse: Process seurat objects at individual level, using mouse annotations only
+```{r dw-process-seurat-individuals-mm, eval = FALSE}
+in_dir <- file.path(params$output_dir, 'seurat')
+out_dir <- file.path(params$output_dir, 'seurat_mm')
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+if(exists('seu_merged'))
+  rm(seu_merged)
+
+slides_id <- sample_annot$sample_alias
+
+sid <- slides_id[2]
+for(sid in slides_id){
+  # sid <- gsub("\\.", "-", sido)
+  cat('Processing slide', sid, '\n')
+  
+  use_seurat <- readRDS(file.path(in_dir, paste0(sid, '.rds')))
+  use_rows <- use_seurat@assays$Spatial@meta.data %>% filter(organism == 'mm')
+  res_seurat <- subset(use_seurat, features = rownames(use_rows))
+  
+  # Add Barcodes to seurat using misc slot
+  use_rows <- use_seurat@assays$Spatial@meta.data %>% filter(organism == 'barcode')
+  bc_seurat <- subset(use_seurat, features = rownames(use_rows))
+  res_seurat@misc$bc_seurat <- bc_seurat
+  
+  # Remove spots with 0 counts. SCTransform does not work with 0 counts
+  res_seurat <- res_seurat[, res_seurat$nCount_Spatial_mm > 0]
+  
+  # Data normalization across spots
+  # sctransform normalizes the data, detects high-variance features, and stores the data in the SCT assay.
+  # Genes being expressed in a < 2 cells/spots will be excluded.
+  res_seurat <- SCTransform(res_seurat, assay = "Spatial", verbose = TRUE, min_cells = 2)
+  
+  # Dimensionality reduction and clustering
+  # res_seurat <- RunPCA(res_seurat, assay = "SCT", verbose = FALSE)
+  # res_seurat <- FindNeighbors(res_seurat, reduction = "pca", dims = 1:30)
+  # res_seurat <- FindClusters(res_seurat, verbose = FALSE)
+  # res_seurat <- RunUMAP(res_seurat, reduction = "pca", dims = 1:30)
+  
+  # Identification of Spatially Variable Features
+  # Check other methods in the future (default is "markvariogram")
+  res_seurat <- FindSpatiallyVariableFeatures(
+    res_seurat, 
+    assay = "SCT", 
+    features = VariableFeatures(res_seurat)[1:1000],
+    selection.method = "moransi")
+  
+  saveRDS(res_seurat, file.path(out_dir, paste0(sid, '.rds')))
+  
+  # Merge Slices
+  if(exists('seu_merged')) {
+    seu_merged <- merge(seu_merged, res_seurat)
+    VariableFeatures(seu_merged) <- c(
+      VariableFeatures(seu_merged), 
+      VariableFeatures(res_seurat)
+      )
+  } else {
+    seu_merged <- res_seurat
+  }
+  # Remove objects
+  rm(res_seurat)
+  
+}
+
+# Process merged object
+seu_merged <- RunPCA(seu_merged, verbose = FALSE)
+seu_merged <- FindNeighbors(seu_merged, dims = 1:30)
+seu_merged <- FindClusters(seu_merged, verbose = FALSE)
+seu_merged <- RunUMAP(seu_merged, dims = 1:30)
+
+# Run integration
+# options(future.globals.maxSize= 26000*1024^2) #26Gb
+seu_merged <- IntegrateLayers(
+  object = seu_merged, 
+  method = RPCAIntegration, 
+  normalization.method = "SCT",
+  orig.reduction = "pca",
+  verbose = TRUE)
+
+# Run clustering using the integrated reduction
+seu_merged <- FindNeighbors(seu_merged, reduction = "integrated.dr", dims = 1:30)
+# We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. 
+seu_merged <- FindClusters(seu_merged, resolution = 1, cluster.name = "clusters.dr", verbose = TRUE)
+
+# Save merged object
+# seu_merged <- readRDS(file.path(out_dir, 'seurat_merged.rds'))
+saveRDS(seu_merged, file.path(out_dir, 'seurat_merged.rds'))
+
+# Convert to semla and apply the 3D transformations
+rigid_transform <- readRDS(file.path(file.path(params$output_dir, 'seurat', 'rigid_transform.rds')))
+                           
+# Generate semla object from seurat_merged, and apply rigid transformation
+seu_merged_semla <- UpdateSeuratForSemla(seu_merged)
+seu_merged_semla <- LoadImages(seu_merged_semla)
+seu_merged_semla <- RigidTransformImages(seu_merged_semla, transforms = rigid_transform, verbose = TRUE) 
+
+# Add z-coordinate from slide information
+z_coord <- read_csv('./external/spatial_tx_annotation/pdac3_st_z_coordinates.csv', comment = "#") %>% select(sample_alias, z_um)
+seu_merged_semla@meta.data %<>% 
+  rownames_to_column('rowname') %>% 
+  left_join(z_coord) %>% 
+  column_to_rownames('rowname')
+
+# Save semla object
+saveRDS(seu_merged_semla, file.path(out_dir, 'seurat_merged_semla.rds'))
+```
+
+Mouse: Integration of data considering spatial information (PRECAST) for human data
+```{r dw-integration-precast-mm, eval = FALSE}
+out_dir <- file.path(params$output_dir, 'seurat_mm')
+seu_merged <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+## Extract transformed coordinates
+use_coords <- GetCoordinates(seu_merged) %>% 
+  select(barcode, pxl_col_in_fullres_transformed, pxl_row_in_fullres_transformed) %>% 
+  rename(
+    col = pxl_col_in_fullres_transformed,
+    row = pxl_row_in_fullres_transformed
+  )
+
+## Create a list of Seurat objects, adding row and col coordiantes to metadata
+### I am using corrected and normalized coordinates after slide alignments
+slides_id <- sample_annot$sample_alias
+sid <- slides_id[2]
+seuList <- foreach(sid = slides_id) %do% {
+  x <- readRDS(file.path(out_dir, paste0(sid, '.rds')))
+  x@meta.data %<>% 
+    rownames_to_column('barcode') %>% 
+    left_join(use_coords, by = c('barcode')) %>%
+    mutate(
+      orig.ident = sample_alias
+    ) %>% 
+    column_to_rownames('barcode')
+  x
+}
+
+## Create a PRECASTObject object
+### The gene list used for PRECAST model fitting will be the top variable list as defined by nnSVG
+### Similar strategy than in : https://pmc.ncbi.nlm.nih.gov/articles/PMC11071618/#S11
+### https://github.com/LieberInstitute/spatial_hpc/blob/main/code/06_clustering/PRECAST/03_add_PRECAST_to_spe.R
+use_var_features <- seu_merged[['SCT']]@var.features
+PRECASTObj <- CreatePRECASTObject(
+  seuList, 
+  project = "PRECAST", 
+  customGenelist = use_var_features)
+
+
+
+## Add adjacency matrix list for a PRECASTObj object to prepare for PRECAST model fitting.
+PRECASTObj <- AddAdjList(PRECASTObj, platform = "Visium")
+## Add a model setting in advance for a PRECASTObj object. verbose =TRUE helps outputing the
+## information in the algorithm.
+PRECASTObj <- AddParSetting(PRECASTObj, Sigma_equal = FALSE, verbose = TRUE, maxIter = 3)
+## Fit PRECAST 
+### Use K using a range given by louvain clsuters in integrated data as a guide
+
+n_clusters <- c(
+  as.numeric(as.character(seu_merged$SCT_snn_res.0.8)) %>% max,
+  as.numeric(as.character(seu_merged$clusters.dr)) %>% max
+)
+
+k_range <- seq(min(n_clusters) - 3,min(n_clusters) + 3)
+
+
+PRECASTObj <- PRECAST(PRECASTObj, K = k_range)
+saveRDS(PRECASTObj, file = file.path(out_dir, 'PRECASTObj_multiK.rds'))
+PRECASTObj <- readRDS(file.path(out_dir, 'PRECASTObj_multiK.rds'))
+
+###Select a best model if 𝐾 is an integer vector. Even if 𝐾 is a scalar, this step is also neccessary to re-organize the results in PRECASTObj object.
+### backup the fitting results in resList
+resList <- PRECASTObj@resList
+PRECASTObj <- SelectModel(PRECASTObj)
+
+## Integrate the samples. For computational efficiency, this function exclusively integrates the variable genes. 
+# print(PRECASTObj@seuList)
+seuInt <- IntegrateSpaData(PRECASTObj, species = "Human")
+
+# Find number of barcodes that are different from spe
+# 
+# length(setdiff(colnames(seu_merged), rownames(seuInt@meta.data)))
+
+k_tab <- data.frame(
+    precast_clusters = seuInt@meta.data$cluster,
+    barcodes = rownames(seuInt@meta.data)
+)
+
+seu_merged@meta.data %<>% 
+  rownames_to_column('rowname') %>%
+  left_join(k_tab, by = c('rowname' = 'barcodes')) %>% 
+  column_to_rownames('rowname')
+
+saveRDS(seu_merged, file.path(out_dir, 'seurat_merged_semla.rds'))
+```
+
+Mouse: Annotate cell types with RCTD using Tabula Muris
+```{r dw-rctd-annotation-taburis-mm, eval = FALSE}
+library(spacexr)
+library(TabulaMurisData)
+
+out_dir <- file.path(params$output_dir, 'seurat_mm')
+# out_dir <- file.path(params$output_dir, 'seurat_mm', 'rctd')
+# dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+ref_name <- 'tabmuris'
+use_seu <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+rownames(use_seu) <- gsub("GRCm39-", "", rownames(use_seu))
+
+# Single-Cell Reference
+### Load in/preprocess reference data
+reference_se <- TabulaMurisDroplet()
+reference_se$cell_type <- reference_se$cell_ontology_class
+ref_celltypes <- reference_se$cell_type
+names(ref_celltypes) <- colnames(reference_se)
+
+
+## Exclude cell types with less than 25 references, required by createRctd
+use_cell_types <- table(ref_celltypes)[table(ref_celltypes) >= 25] %>% names
+ref_celltypes <- ref_celltypes[ref_celltypes %in% use_cell_types]
+ref_celltypes <- factor(ref_celltypes)
+ref_counts <- assay(reference_se[,names(ref_celltypes)], 'counts')
+rownames(ref_counts) <- make.names(rowData(reference_se)$Symbol, unique = TRUE)
+
+### Create the Reference object
+reference <- Reference(ref_counts, ref_celltypes)
+
+# # Run RCTD on spatial transcriptomis data
+# # We need to collect the counts matrix for each sample, otherwise, RCTD will only run on 
+# # the first sample of sce only
+# 
+# counts <- use_seu[["Spatial"]]$counts
+# 
+# seurat_files <- list.files(out_dir, pattern = "S[0-9]+.*.rds", full.names = TRUE)
+# i <- seurat_files[5]
+# foreach(i = seurat_files) %do% {
+#   use_seu <- readRDS(i)
+#   use_sample_alias <- basename(i) %>% gsub('\\.rds', '', .)
+#   
+#   # Spatial Transcriptomics data
+#   counts <- use_seu[["Spatial"]]$counts
+#   rownames(counts) <- gsub("GRCm39-", "", rownames(counts))
+#   nUMI <- colSums(counts) # In this case, total counts per pixel is nUMI
+#   # Crete puck object
+#   # using fake coords to ignore spatial coordinates : https://github.com/dmcable/spacexr/issues/113
+#   puck <- SpatialRNA(counts = counts, nUMI = nUMI, use_fake_coords = TRUE)
+#   
+#   # Run RCTD: we need to do it at sample level, otherwise, RCTD will only run on
+#   # the first sample of sce
+#   rctd_res <- create.RCTD(puck, reference,  CELL_MIN_INSTANCE = 25, max_cores = 6)
+#   rctd_res_multi <- run.RCTD(rctd_res, doublet_mode = 'multi')
+#   saveRDS(rctd_res_multi, file.path(out_dir, paste0('rctd_multi_tabmuris.rds')))
+#   rctd_res_full <- run.RCTD(rctd_res, doublet_mode = 'full')
+#   saveRDS(rctd_res_full, file.path(out_dir, paste0('rctd_full_tabmuris.rds')))
+# 
+# }
+
+# Spatial Transcriptomics data
+use_seu[["Spatial"]] <- JoinLayers(use_seu[["Spatial"]])
+counts <- use_seu[["Spatial"]]$counts
+
+# coords <- foreach(i = seu_list, .combine = rbind) %do% {
+#   GetTissueCoordinates(i)
+# }
+# coords <- coords[colnames(counts),]
+nUMI <- colSums(counts) # In this case, total counts per pixel is nUMI
+# Crete puck object
+# using fake coords to ignore spatial coordinates : https://github.com/dmcable/spacexr/issues/113
+puck <- SpatialRNA(counts = counts, nUMI = nUMI, use_fake_coords = TRUE)
+
+# Run RCTD: we need to do it at sample level, otherwise, RCTD will only run on
+# the first sample of sce
+rctd_res <- create.RCTD(puck, reference,  CELL_MIN_INSTANCE = 25, max_cores = 6)
+rctd_res_multi <- run.RCTD(rctd_res, doublet_mode = 'multi')
+saveRDS(rctd_res_multi, file.path(out_dir, paste0('rctd_multi_', ref_name,'.rds')))
+rctd_res_full <- run.RCTD(rctd_res, doublet_mode = 'full')
+saveRDS(rctd_res_full, file.path(out_dir, paste0('rctd_full_', ref_name,'.rds')))
+
+# Extract results
+rctd_multi <- readRDS(file.path(out_dir, paste0('rctd_multi_', ref_name,'.rds')))
+rctd_multi_df <- foreach(i = 1:length(rctd_multi@results), .combine = rbind) %do% {
+  res <- rctd_multi@results[[i]]
+  n_ct <- length(res$cell_type_list)
+  data.frame(
+    # Assuming that the pixel order is the same as the one in the originnal spatial data
+    barcode = rep(names(rctd_multi@originalSpatialRNA@nUMI)[i], n_ct),
+    # convergence
+    conv_all = rep(res$conv_all, n_ct),
+    conv_sub = rep(res$conv_sub, n_ct),
+    cell_type = res$cell_type_list,
+    confidence = res$conf_list,
+    # The weights represent cell type proportions. 
+    weight = res$sub_weights,
+    # "min_score" is the likelihood score of the doublet model (two cell types on the pixel)
+    min_score = rep(res$min_score, n_ct)
+  )
+}
+saveRDS(rctd_multi_df, file.path(out_dir, paste0('rctd_multi_df_', ref_name,'.rds')))
+
+
+
+# Group cell types
+rctd_multi_df %<>% 
+  mutate(
+    cell_type_grouped = case_when(
+      grepl('monocyte', cell_type) ~ 'monocyte',
+      grepl('epithelial', cell_type) ~ 'epithelial cell',
+      grepl('macrophage', cell_type) ~ 'macrophage',
+      grepl('endothelial', cell_type) ~ 'endothelial cell',
+      grepl('B cell', cell_type) ~ 'B cell',
+      grepl('T cell', cell_type) ~ 'T cell',
+      .default = cell_type
+      )
+  )
+
+# Remove cell types with less than 100 spots
+use_cell_type <- rctd_multi_df$cell_type_grouped %>% table %>% data.frame %>% set_names(c('cell_type', 'Freq')) %>% filter(Freq > 100)
+rctd_multi_df %<>% 
+  filter(cell_type_grouped %in% use_cell_type$cell_type)
+
+# Remove cell types that are not of interest
+rctd_multi_df %<>% 
+  filter(!cell_type_grouped %in% c('epithelial cell', 'kidney cell', 'bladder urothelial cell', 
+                                   'skeletal muscle satellite cell', 'hepatocyte', 'type II pneumocyte',
+                                   'mesangial cell', 'basal cell', 'endocardial cell', 'bladder cell'))
+# Factorize cell types by frequency
+rctd_multi_df %<>% 
+  mutate(cell_type_grouped = fct_infreq(cell_type_grouped))
+
+# save modified rctd_multi_df
+saveRDS(rctd_multi_df, file.path(out_dir, paste0('rctd_multi_df_', ref_name,'_filtered.rds')))
+
+```
+
+Mouse: Annotate cell types with the same reference as Khaliq et al. 2024
+```{r dw-rctd-annotation-khaliq2024-mm, eval = FALSE}
+library(spacexr)
+library(babelgene)
+ref_name <- 'khaliq2024'
+out_dir <- file.path(params$output_dir, 'seurat_mm')
+
+use_seu <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+ref_seu <- readRDS('./data/resources/khaliq_natgenet_2024/scRNA-seq_Data_post_qc.rds')
+
+# Obtain orthologs
+genes_orth <- orthologs(rownames(ref_seu@assays[['RNA']]), species = 'mouse', 
+                        human = TRUE, min_support = 3, top = TRUE) %>%
+  select(human_symbol, symbol) %>%
+  unique
+genes_orth$human_symbol <- make.names(genes_orth$human_symbol,unique = TRUE)
+genes_orth$symbol <- make.names(genes_orth$symbol,unique = TRUE)
+
+# Convert to mouse
+i <- 'RNA'
+genes2mouse <- data.frame(human_symbol = rownames(ref_seu@assays[[i]])) %>%
+  left_join(genes_orth) %>%
+  mutate(symbol = ifelse(!is.na(symbol), paste('GRCm39-', symbol, sep = ''), symbol)) %>%
+  unique
+genes2mouse_scaledata <- data.frame(human_symbol = rownames(ref_seu@assays[[i]]@scale.data)) %>%
+  left_join(genes_orth) %>%
+  mutate(symbol = ifelse(!is.na(symbol), paste('GRCm39-', symbol, sep = ''), symbol)) %>%
+  unique
+genes2mouse_var.features <- data.frame(human_symbol = ref_seu@assays[[i]]@var.features) %>%
+  left_join(genes_orth) %>%
+  mutate(symbol = ifelse(!is.na(symbol), paste('GRCm39-', symbol, sep = ''), symbol)) %>%
+  unique
+
+# Subset genes with mouse orthologs and change rownames
+i <- 'RNA'
+ref_seu_mm <- subset(ref_seu, features = genes2mouse$human_symbol[!is.na(genes2mouse$symbol)])
+assay_data <- ref_seu_mm[[i]]
+rownames(assay_data@scale.data) <- genes2mouse_scaledata$symbol[!is.na(genes2mouse_scaledata$symbol)]
+rownames(assay_data@counts) <- genes2mouse$symbol[!is.na(genes2mouse$symbol)]
+rownames(assay_data@data)   <- genes2mouse$symbol[!is.na(genes2mouse$symbol)]
+rownames(assay_data@meta.features) <- genes2mouse$symbol[!is.na(genes2mouse$symbol)]
+assay_data@var.features <- genes2mouse_var.features$symbol[!is.na(genes2mouse_var.features$symbol)]
+ref_seu_mm[["RNA"]] <- assay_data
+
+# Filter cell types:  include cell types that could appear in NSG mouse
+
+ct_to_rm <- c(
+  'Hepatocytes', 
+  'T_NK cells', 
+  'Tumor Epithelial cells', 
+  'Normal Epithelial cells'
+  )
+ref_seu_mm <- ref_seu_mm[,!ref_seu_mm$celltype_new %in% ct_to_rm]
+
+# Prepare data for RCTD
+counts <- ref_seu_mm@assays$RNA@counts
+Idents(ref_seu_mm) <- "celltypes"
+cluster <- as.factor(ref_seu_mm$celltypes)
+names(cluster) <- colnames(ref_seu_mm)
+nUMI <- ref_seu_mm$nCount_RNA
+names(nUMI) <- colnames(ref_seu_mm)
+
+# Create the reference object
+reference <- Reference(counts, cluster, nUMI)
+
+# Spatial Transcriptomics data
+use_seu[["Spatial"]] <- JoinLayers(use_seu[["Spatial"]])
+counts <- use_seu[["Spatial"]]$counts
+
+
+coordinates_list <- lapply(use_seu@images %>% names, function(image_name) {
+  pos <- GetTissueCoordinates(use_seu, image = image_name)
+  colnames(pos) <- c('x','y')
+  return(pos[,c('x', 'y')])
+})
+coords <- do.call(rbind, coordinates_list)
+
+nUMI <- colSums(counts) # In this case, total counts per pixel is nUMI
+
+# Crete puck object
+puck <- SpatialRNA(coords = coords, counts = counts, nUMI = nUMI)
+
+
+# Run RCTD
+rctd_res <- create.RCTD(puck, reference,  CELL_MIN_INSTANCE = 25, max_cores = 8)
+rctd_res_multi <- run.RCTD(rctd_res, doublet_mode = 'multi')
+saveRDS(rctd_res_multi, file.path(out_dir, paste0('rctd_multi_', ref_name,'.rds')))
+rctd_res_full <- run.RCTD(rctd_res, doublet_mode = 'full')
+saveRDS(rctd_res_full, file.path(out_dir, paste0('rctd_full_', ref_name,'.rds')))
+
+
+
+# Extract results
+rctd_multi <- readRDS(file.path(out_dir, paste0('rctd_multi_', ref_name,'.rds')))
+rctd_multi_df <- foreach(i = 1:length(rctd_multi@results), .combine = rbind) %do% {
+  res <- rctd_multi@results[[i]]
+  n_ct <- length(res$cell_type_list)
+  data.frame(
+    # Assuming that the pixel order is the same as the one in the originnal spatial data
+    barcode = rep(names(rctd_multi@originalSpatialRNA@nUMI)[i], n_ct),
+    # convergence
+    conv_all = rep(res$conv_all, n_ct),
+    conv_sub = rep(res$conv_sub, n_ct),
+    cell_type = res$cell_type_list,
+    confidence = res$conf_list,
+    # The weights represent cell type proportions. 
+    weight = res$sub_weights,
+    # "min_score" is the likelihood score of the doublet model (two cell types on the pixel)
+    min_score = rep(res$min_score, n_ct)
+  )
+}
+saveRDS(rctd_multi_df, file.path(out_dir, paste0('rctd_multi_df_', ref_name,'.rds')))
+
+```
+
+Mouse: Annotate cell types with the same signatures used in Fges in Khaliq et al. 2024 using UCell scores
+```{r ucell-khaliq2024, eval = FALSE}
+library(babelgene)
+library(UCell)
+library(openxlsx)
+out_dir <- file.path(params$output_dir, 'seurat_mm')
+use_seu <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+# Read original signatures
+sdf <- read.xlsx(
+  './data/resources/khaliq_natgenet_2024/1-s2.0-S1535610821002221-mmc2.xlsx', 
+  sheet = 'Gene Description', 
+  startRow = 2)
+sdf_list <- split(sdf, sdf$Gene.signature)
+
+# Get mouse orthologs and intersect with seurat object
+sig <- sdf_list[[1]]
+gene_sig <- foreach(sig = sdf_list) %do% {
+  use_genes_hs <- sig$Gene
+  genes_orth <- orthologs(use_genes_hs,
+                          species = 'mouse', human = TRUE, min_support = 3, top = TRUE) %>%
+    select(human_symbol, symbol) %>%
+    unique
+  res <- genes_orth$symbol %>% 
+    unique %>% 
+    paste0('GRCm39-', .)
+  res <- res[res %in% rownames(use_seu)]
+  return(res)
+}
+
+names(gene_sig) <- names(sdf_list)
+
+res_seu <- AddModuleScore_UCell(use_seu, features = gene_sig, ncores=4)
+res <- res_seu@meta.data %>% rownames_to_column('sample_barcode') %>% select(sample_barcode, ends_with('UCell'))
+saveRDS(res, file.path(out_dir, 'ucell_khaliq2024.rds'))
+```
+
+Mouse: Annotate ECM pathways
+```{r ucell-khaliq2024, eval = FALSE}
+library(UCell)
+out_dir <- file.path(params$output_dir, 'seurat_mm')
+use_seu <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+# Load gene set genes lists for ECM pathways
+use_gsets <- list(
+  Collagens = c('Col1a1', 'Col1a2', 'Col3a1', 'Col6a3'),
+  Glycoproteins =  c('Fbn1', 'Fn1', 'Fga', 
+                  'Fgb', 'Fgg', 'Postn'),
+  Proteoglycans = c('Dcn', 'Bgn', 'Ogn', 
+                  'Lum')
+)
+use_gsets$ECM <- unlist(use_gsets)
+
+use_gsets_mm <- foreach(i = use_gsets) %do% {
+  i <- paste0('GRCm39-', i)
+  i <- i[i %in% rownames(use_seu)]
+  return(i)
+} 
+names(use_gsets_mm) <- names(use_gsets)
+
+res_seu <- AddModuleScore_UCell(use_seu, features = use_gsets_mm, ncores=4)
+
+res <- res_seu@meta.data %>% rownames_to_column('sample_barcode') %>% select(sample_barcode, ends_with('UCell'))
+saveRDS(res, file.path(out_dir, 'ucell_ecm.rds'))
+```
+
+Human: Establish expression modules using geneNMF
+```{r geneNMF-hs, eval = FALSE}
+library(GeneNMF)
+library(UCell)
+library(RColorBrewer)
+library(UpSetR)
+library(msigdbr)
+library(fgsea)
+library(viridis)
+
+out_dir <- file.path(params$output_dir, 'seurat_hs')
+seurat_hs <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+# rownames(seurat_hs) <- gsub("GRCh38-", "", rownames(seurat_hs))
+seu_list <- SplitObject(seurat_hs, split.by = "sample_alias")
+
+for(i in 1:length(seu_list)) {
+  layer_name <- names(seu_list[[i]]@assays$Spatial@layers)
+  seu_list[[i]][["Spatial"]]$data <- seu_list[[i]][["Spatial"]][layer_name]
+  seu_list[[i]][["Spatial"]][layer_name] <- NULL
+
+}
+
+geneNMF_programs <- multiNMF(seu_list, assay="Spatial", slot = "data", k=4:9, min.exp = 0.05, max.exp = 10)
+                             
+saveRDS(geneNMF_programs, file.path(out_dir, 'geneNMF_programs.rds'))
+# geneNMF_programs <- readRDS(file.path(out_dir, 'geneNMF_programs.rds'))
+
+geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs,
+                                        metric = "cosine",
+                                        #  controls how much MP signatures are allowed to overlap. higher values (e.g. =8) enforces higher sparsity in the decomposition.
+                                        specificity.weight = 6, 
+                                        # include all genes that allow to explain X% of loadings in the consensus gene set. The higher, the larger number of genes per module
+                                        weight.explained = 0.8, 
+                                        nMP = 7,
+                                        # focus on genes consistently found across at least X% of the individual programs
+                                        min.confidence = 0.5 
+                                        )
+saveRDS(geneNMF_metaprograms, file.path(out_dir, 'geneNMF_metaprograms.rds'))
+# geneNMF_metaprograms <- readRDS(file.path(out_dir, 'geneNMF_metaprograms.rds'))
+# Remove metaprograms with negative silhouette score
+drop_MP <- geneNMF_metaprograms$metaprograms.metrics %>% filter(silhouette < 0) %>% 
+  rownames
+if(length(drop_MP) > 0)
+  geneNMF_metaprograms <- dropMetaPrograms(geneNMF_metaprograms, dropMP = drop_MP)
+
+
+# Plot metaprograms
+anno_colors <- brewer.pal(n=geneNMF_metaprograms$metaprograms.genes %>% length(), name="Paired")
+names(anno_colors) <- names(geneNMF_metaprograms$metaprograms.genes)
+plotMetaPrograms(geneNMF_metaprograms,
+                       # palette=viridis(100, option = "H", direction = 1),
+                       annotation_colors = anno_colors,
+                       similarity.cutoff = c(0,1))
+
+# Check overlapping between gene programs
+upset(fromList(geneNMF_metaprograms$metaprograms.genes), nsets = length(geneNMF_metaprograms$metaprograms.genes))
+
+
+# Add modules scores to spots using UCell
+mp.genes <- geneNMF_metaprograms$metaprograms.genes
+ucell_mp <- foreach(use_seu = seu_list, .combine = rbind) %do% {
+  res <- AddModuleScore_UCell(use_seu, features = mp.genes, ncores=4, name = "")
+  res@meta.data %>%  rownames_to_column('sample_spot') %>% select(sample_spot, starts_with('MP'))
+}
+saveRDS(ucell_mp, file.path(out_dir, 'geneNMF_metaprograms_ucell.rds'))
+# ucell_mp <- readRDS(file.path(out_dir, 'geneNMF_metaprograms_ucell.rds'))
+
+
+
+# Interpretation of gene programs
+# msigdbr_collections() %>% data.frame
+gsea_gobp <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "C5", 
+          subcategory = "GO:BP",
+          species = "Homo sapiens"
+          )
+})
+
+gsea_h <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "H", 
+          species = "Homo sapiens"
+          )
+})
+
+gsea_c2_cp <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "C2", 
+          subcategory = "CP",
+          species = "Homo sapiens"
+  )
+})
+
+gsea_3ca <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "C4", 
+          subcategory = "3CA",
+          species = "Homo sapiens"
+  )
+})
+
+gsea_react <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "C2", 
+          subcategory = "CP:REACTOME",
+          species = "Homo sapiens"
+  )
+})
+
+gsea_kegg <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "C2", 
+          subcategory = "CP:KEGG_LEGACY",
+          species = "Homo sapiens"
+  )
+})
+
+gsea_wp <- lapply(geneNMF_metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program %>% gsub('GRCh38-', '', .), 
+          universe=rownames(seurat_hs), 
+          category = "C2", 
+          subcategory = "CP:WIKIPATHWAYS",
+          species = "Homo sapiens"
+  )
+})
+
+gsea_res <- list(
+  `GO:BP` = gsea_gobp,
+  `Hallmarks` = gsea_h,
+  `C2CP` =gsea_c2_cp,
+  `3CA` =gsea_3ca,
+  `Reactome` =gsea_react,
+  `KEGG` =gsea_kegg,
+  `WP` =gsea_wp
+)
+
+saveRDS(gsea_res, file = file.path(out_dir, 'geneNMF_metaprograms_gsea.rds'))
+
+# Add MP to seurat_hs
+seurat_hs@meta.data %<>% mutate(sample_spot = colnames(seurat_hs)) %>% left_join(ucell_mp) %>% column_to_rownames('sample_spot')
+
+
+# Signature scores to define integrated spaces
+mp.genes <- geneNMF_metaprograms$metaprograms.genes
+dimred <- seurat_hs@meta.data[,names(mp.genes)] %>% as.matrix
+colnames(dimred) %<>% gsub('MP', 'MP_', .)
+seurat_hs@reductions[["MPsignatures"]] <- new("DimReduc",
+                                              cell.embeddings = dimred,
+                                              assay.used = "Spatial",
+                                              key = "MP_",
+                                              global = FALSE)
+
+set.seed(123)
+seurat_hs <- RunUMAP(seurat_hs, reduction="MPsignatures", dims=1:length(seurat_hs@reductions[["MPsignatures"]]),
+               metric = "euclidean", reduction.name = "umap_MP")
+
+DimPlot(seurat_hs, reduction = "umap_MP", group.by = "sample_alias") + theme(aspect.ratio = 1)
+
+
+FeaturePlot(seurat_hs, features = names(mp.genes), reduction = "umap_MP", ncol=4) &
+  scale_color_viridis(option="B") &
+  theme(aspect.ratio = 1, axis.text=element_blank(), axis.ticks=element_blank())
+
+saveRDS(seurat_hs, file = file.path(out_dir, 'seurat_merged_semla_geneNMF.rds'))
+
+
+```
+
+Human: Calculate expression score for cancer metaprograms (3CA) using UCell
+```{r ucell-3ca, eval = FALSE}
+library(UCell)
+out_dir <- file.path(params$output_dir, 'seurat_hs')
+seu_merged <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+rownames(seu_merged@assays$SCT@counts) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@counts))
+rownames(seu_merged@assays$SCT@data) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@data))
+rownames(seu_merged@assays$SCT@scale.data) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@scale.data))
+
+
+# https://www.weizmann.ac.il/sites/3CA/
+# https://www.nature.com/articles/s41586-023-06130-4
+library(openxlsx)
+data_3ca <- read.xlsx('./data/resources/curated_cancer_cell_atlas/meta_programs_2025-01-29.xlsx', sheet = 'Malignant')
+colnames(data_3ca) <- gsub('\\.', ' ', colnames(data_3ca))
+list_3ca <- foreach(i = colnames(data_3ca)) %do% data_3ca[[i]]
+names(list_3ca) <-  colnames(data_3ca)
+
+seu_3ca <- AddModuleScore_UCell(seu_merged, features = list_3ca, ncores=3, name = "_3ca")
+res_3ca <- seu_3ca@meta.data %>% rownames_to_column('sample_barcode') %>% select(sample_barcode, starts_with('MP'))
+saveRDS(res_3ca, file.path(out_dir, 'ucell_3ca.rds'))
+
+```
+
+Human: Calculate expression score for MSigDB using UCell
+```{r ucell-msigdb, eval = FALSE}
+library(UCell)
+out_dir <- file.path(params$output_dir, 'seurat_hs')
+seu_merged <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+rownames(seu_merged@assays$SCT@counts) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@counts))
+rownames(seu_merged@assays$SCT@data) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@data))
+rownames(seu_merged@assays$SCT@scale.data) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@scale.data))
+
+# params$msigdb_dir= './data/resources/MSigDB'
+# params$msigdb_vs= 'v2025.1.Hs'
+  
+gmt_files_symbols <- list(
+  hallmarks= paste0(params$msigdb_dir, '/', params$msigdb_vs, '/h.all.', params$msigdb_vs, '.symbols.gmt'),
+  c2cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+
+gmt_name <- names(gmt_files_symbols)[1]
+for(gmt_name in names(gmt_files_symbols)) {
+  cat('Processing', gmt_name, '\n')
+  gmt_file <- gmt_files_symbols[[gmt_name]]
+  gmt_list <- GSVA::readGMT(gmt_file, valueType="list")
+  seu_res <- AddModuleScore_UCell(seu_merged, features = gmt_list, ncores=6, name = paste0('_', gmt_name))
+  res <- seu_res@meta.data %>% rownames_to_column('sample_barcode') %>% select(sample_barcode, starts_with('MP'))
+  saveRDS(res, file.path(out_dir, paste0('ucell_msigdb_',gmt_name,'.rds')))
+
+}
+
+```
+
+Human: Calculate expression score for CTC and CTO signatures from RNA-seq
+```{r ucell-ctc-cto-signatures, eval = FALSE}
+library(UCell)
+out_dir <- file.path(params$output_dir, 'seurat_hs')
+seu_merged <- readRDS(file.path(out_dir, 'seurat_merged_semla.rds'))
+
+rownames(seu_merged@assays$SCT@counts) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@counts))
+rownames(seu_merged@assays$SCT@data) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@data))
+rownames(seu_merged@assays$SCT@scale.data) <-  gsub('GRCh38-', '', rownames(seu_merged@assays$SCT@scale.data))
+
+# Load results from CTC versus CTO
+dge_list <- readRDS('./output/rnaseq/pdac3-ctc/differential_expression_edger/sample_type/dge-edgeR_QLF.rds')
+gse_list <- readRDS('./output/rnaseq/pdac3-ctc/differential_expression_edger/sample_type/gse_omnibus-edgeR_QLF.rds')
+
+dge_cl <- dge_list[['CTO-over-Cl-mouse_id']]$results %>% 
+  dplyr::select(gene_name, logFC,PValue,FDR)
+dge_s <- dge_list[['CTO-over-S-mouse_id']]$results %>% 
+  dplyr::select(gene_name, logFC,PValue,FDR)
+
+fc_treshold <- 0.75
+use_dge <- full_join(dge_cl, dge_s, by = 'gene_name', suffix = c('.cl', '.s')) %>% 
+  filter(!is.na(logFC.cl) & !is.na(logFC.s)) %>%
+  mutate(
+    direction = ifelse(logFC.cl >= fc_treshold & logFC.s >= fc_treshold, 'up', NA),
+    direction = ifelse(logFC.cl <= -fc_treshold & logFC.s <= -fc_treshold, 'down', direction),
+    
+    cto_signature = direction == 'up' & (FDR.cl <= 0.10 | FDR.s <= 0.10),
+    ctc_signature = direction == 'down' & (FDR.cl <= 0.10 | FDR.s <= 0.10),
+    
+    cto_s_signature = (logFC.s >= fc_treshold) & (FDR.s <= 0.10),
+    cto_cl_signature = (logFC.cl >= fc_treshold) & (FDR.cl <= 0.10),
+    
+    s_cto_signature = (logFC.s <= -fc_treshold) & (FDR.s <= 0.10),
+    cl_cto_signature = (logFC.cl <= -fc_treshold) & (FDR.cl <= 0.10),
+    
+  ) %>% 
+  filter(!is.na(direction))
+
+cto_genes <- use_dge %>% 
+  filter(cto_signature) %>% 
+  pull(gene_name)
+
+ctc_genes <- use_dge %>% 
+  filter(ctc_signature) %>% 
+  pull(gene_name)
+
+cto_ctc_signatures <- list(
+  
+  CTC = use_dge %>% 
+  filter(ctc_signature) %>% 
+  pull(gene_name),
+  
+  CTO = use_dge %>% 
+  filter(cto_signature) %>% 
+  pull(gene_name),
+  
+  CTO_S = use_dge %>% 
+  filter(cto_s_signature) %>% 
+  pull(gene_name),
+  
+  CTO_CL = use_dge %>% 
+  filter(cto_cl_signature) %>% 
+  pull(gene_name),
+  
+  S_CTO = use_dge %>% 
+  filter(s_cto_signature) %>% 
+  pull(gene_name),
+  
+  CL_CTO = use_dge %>% 
+  filter(cl_cto_signature) %>% 
+  pull(gene_name)
+)
+
+seu_res <- AddModuleScore_UCell(seu_merged, features = cto_ctc_signatures, ncores=6)
+res <- seu_res@meta.data %>% rownames_to_column('sample_barcode') %>% select(sample_barcode, ends_with('UCell'))
+saveRDS(res, file.path(out_dir, 'ucell_ctc_cto_smatseq2.rds'))
+```
+
+Barcodes: generate matrix of barcodes
+```{r dw-bc-matrix, eval = FALSE}
+in_dir <- file.path(params$output_dir, 'seurat')
+out_dir <- file.path(params$output_dir, 'seurat_bc')
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Generate a list of counts matrices
+slides_id <- sample_annot$sample_alias
+sid <- slides_id[2]
+bc_mat_list <- foreach(sid = slides_id) %do% {
+  use_seurat <- readRDS(file.path(in_dir, paste0(sid, '.rds')))
+  use_features <- use_seurat[['Spatial']]@meta.data %>% 
+    filter(organism == 'barcode') %>% 
+    pull('gene_name_sp')
+  res <- use_seurat[['Spatial']]$counts[use_features,] %>% 
+    data.frame(check.names = FALSE) %>% 
+    rownames_to_column('bc')
+  return(res)
+}
+
+# Join counts matrices
+require(Matrix)
+bc_mat <- purrr::reduce(bc_mat_list, full_join, by = "bc") %>% 
+  column_to_rownames('bc') %>% 
+  as.matrix %>% 
+  Matrix(sparse = TRUE)
+
+bc_mat[is.na(bc_mat)] <- 0
+
+saveRDS(bc_mat, file.path(out_dir, 'bc_matrix.rds'))
+```

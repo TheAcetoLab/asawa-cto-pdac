@@ -1,0 +1,1377 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "Differential expression of spots by CAF distance using human reads"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+  min_counts: 5
+  min_present_prop: 0.25
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2023.1.Hs
+  ncores: 4
+---
+
+
+
+## Configuration
+
+Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(knitr)
+library(patchwork)
+library(kableExtra)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(UpSetR)
+library(GGally)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(arsenal)
+library(Seurat)
+library(SummarizedExperiment)
+library(semla)
+library(edgeR)
+library(scran)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data processing 
+
+### Load initial data
+
+Load human seurat data
+```{r dw-load-seurat}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+```
+
+### CAF distance
+
+Here we will define the distance of each spot to the nearest CAF spot, which we will use later to define the distance of each barcode hotspot to CAFs. *CHECK DESCRIPTION: We will use the same approach as in the previous analysis, but we will use the spatial coordinates of the spots instead of the UMAP coordinates. We will also use a different threshold for defining CAF spots, which is based on the expression of a CAF marker gene, such as FAP or PDGFRB. We will define CAF spots as those that have at least 1 count of the marker gene in the spatial data. We will then calculate the distance of each spot to the nearest CAF spot using the `semla::GetSpatialNetwork` function, which calculates a spatial network based on the spatial coordinates of the spots and a distance threshold. We will use a distance threshold that is based on the median distance between spots in the spatial data, which we will calculate using the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots.*
+
+Warning: Data produced by **pdac3-visium-bc-reanalysis.Rmd**
+
+Load dataset and add CAF distance to seurat object
+```{r caf-distance-df-load}
+caf_hotspot_r_dist <- readRDS(file.path(params$output_dir, 'caf/caf_hotspot_r_dist.rds'))
+
+```
+
+
+
+### Process seurat object
+```{r dw-process-seurat, eval = FALSE}
+seu <- PrepSCTFindMarkers(seu, assay = "SCT")
+
+
+# Change rownames
+rownames(seu@assays[['Spatial']]) <-  gsub('GRCh38-', '',rownames(seu@assays[['Spatial']]))
+
+i <- 'SCT'
+rownames(seu@assays[[i]]@counts) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@counts))
+rownames(seu@assays[[i]]@data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@data))
+rownames(seu@assays[[i]]@scale.data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@scale.data))
+seu@assays[[i]]@var.features <- gsub('GRCh38-', '', seu@assays[[i]]@var.features)
+
+# Add distance to CAF spots
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(caf_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+```
+
+
+
+
+
+### Compare spots by CAF distance
+```{r dw-findmarkers-caf-regions, eval = FALSE}
+chunk_suffix <- 'caf_distance_100_1000'
+seu[[]] <- seu[[]] %>% 
+  mutate(
+    caf_dist_cat = 'intermediate',
+    caf_dist_cat = ifelse(
+      r_dist_caf_hotspot_3d_transformed < 100, 'l100um',
+      caf_dist_cat
+    ),
+    caf_dist_cat = ifelse(
+      r_dist_caf_hotspot_3d_transformed > 1000, 'u1000um',
+      caf_dist_cat
+    ),
+    caf_dist_cat = factor(caf_dist_cat)
+  )
+
+# use_comparisons <- combn(rev(levels(seu$caf_dist_cat)), 2, simplify = FALSE)
+use_comparisons <- list(
+  c('l100um', 'u1000um')
+)
+
+
+# All pairwise comparisons
+use_seu <- seu
+res_markers <- foreach(i = use_comparisons) %do% {
+  spots_sample <- colnames(use_seu)[use_seu$caf_dist_cat == i[1]]
+  spots_ref <- colnames(use_seu)[use_seu$caf_dist_cat == i[2]]
+  
+  de_markers <- FindMarkers(use_seu, 
+                            ident.1 = spots_sample,
+                            ident.2 = spots_ref,
+                            logfc.threshold = 0.2,
+                            min.pct = 0.01,
+                            test.use = "wilcox")
+  list(
+    result = de_markers %>% rownames_to_column('gene'),
+    ident.1 = spots_sample,
+    ident.2 = spots_ref,
+    ident.1.name = i[1],
+    ident.2.name = i[2]
+  )
+}
+names(res_markers) <- foreach(i = use_comparisons) %do% {
+  paste0(i[1], '-over-', i[2])
+} %>% unlist
+
+saveRDS(res_markers, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+
+```
+
+
+Perform functional enrichment for specific comparisons
+```{r dw-findmarkers-gse_omnibus-comparisons, eval = FALSE}
+chunk_suffix <- 'caf_distance_100_1000'
+res_markers <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+# Run functional enrichment
+library(org.Hs.eg.db)
+
+dge_i <-  res_markers[[1]]
+
+gse_list <- foreach(dge_i = res_markers) %do%{
+  dge <- dge_i$result
+  gse_res <- gse_omnibus(
+    feature_names = dge$gene,
+    p = dge$p_val_adj,
+    fc = dge$avg_log2FC,
+    fc_thrs = 0,
+    gmt_files = gmt_files_symbols,
+
+    run_enricher = FALSE,
+    run_enrichGO = FALSE,
+    run_enrichReactome = FALSE,
+
+    run_GSEA = TRUE,
+    run_gseGO = FALSE,
+    run_gseReactome = FALSE,
+    
+    go_ontologies = c('BP', 'MF'),
+    go_simplify_p = 0.05,
+    go_simplify_cutoff = 0.7,
+    
+    args_enricher = list(qvalueCutoff = 1, 
+                         minGSSize = 10, 
+                         maxGSSize = 250, 
+                         pvalueCutoff = 1),
+    
+    args_gse = list(minGSSize = 10, 
+                    maxGSSize = 250, 
+                    pvalueCutoff = 1, 
+                    BPPARAM = BiocParallel::MulticoreParam(params$ncores)
+    )
+  )
+  
+  return(gse_res)
+  
+}
+names(gse_list) <- names(res_markers)
+
+saveRDS(gse_list, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+```
+
+## FindMarkers results
+
+The tables of results can be downloaded using the following links:
+
+```{r  write-dge-xlsx-comp}
+chunk_suffix <- 'caf_distance_100_1000'
+dge_list <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+file_xlsx <- file.path('./docs/file',
+                       rmd_file, 
+                       paste0('dge_', chunk_suffix, '.xlsx')
+                       )
+
+dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+
+# Generate workbook
+wb <- createWorkbook()
+for(i in names(dge_list)) {
+  addWorksheet(wb, i)
+  res <- dge_list[[i]]$result
+  writeData(wb, i, res)
+}
+saveWorkbook(wb, file_xlsx, TRUE)
+
+dge_file_xlsx <- file_xlsx
+```
+
+- [**FindMarkers for CAF distance categorised**](`r gsub("docs/", "" , dge_file_xlsx)`)
+
+
+
+## GSEA for specific comparisons
+```{r gsea-conf-comparisons}
+chunk_suffix <- 'caf_distance_100_1000'
+gse_list <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+
+# Get gene set grouping 
+gsets_grouping_file <- './data/external/pdac3_caf_distance_gsea_gsets_groups.xlsx' 
+gsets_sheets <- readxl::excel_sheets(path = gsets_grouping_file)
+gsets_groups <- foreach(i = gsets_sheets) %do% {
+  readxl::read_xlsx(gsets_grouping_file, sheet = i)
+}
+names(gsets_groups) <- gsets_sheets
+```
+
+
+### Download results
+
+<!-- Write GSEA results to xlsx file -->
+```{r  write-gsea-xlsx-comparisons}
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseReactome = 'gseReactome'
+)
+    
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+for(sr in names(gse_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in gse_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('gsea_', chunk_suffix, '_', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      addWorksheet(wb, i)
+      if(gc != sr){
+        if(!is.null(gse_list[[i]][[sr]][[gc]])) {
+          res <- gse_list[[i]][[sr]][[gc]]@result
+          writeData(wb, i, res)
+        }
+      }
+      if(gc == sr){
+        if(!is.null(gse_list[[i]][[sr]])) {
+          res <- gse_list[[i]][[sr]]@result
+          writeData(wb, i, res)
+        }
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Write links to download GSEA results -->
+```{r write-ctc-gsea-xlsx-links-comparisons, echo = FALSE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'GSEA') {
+      cat(paste0("- [**Gene set enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'gseGO') {
+      cat(paste0("- [**Gene set enrichment analysis: GO:", gc, "**](", file_xlsx, ")"), '\n\n')
+    }   
+    if(sr == 'gseKEGG') {
+      cat(paste0("- [**Gene set enrichment analysis: KEGG**](", file_xlsx, ")"), '\n\n')
+    }  
+    if(sr == 'gseReactome') {
+      cat(paste0("- [**Gene set enrichment analysis: Reactome**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+
+### Dotplots
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-comparisons, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseReactome = 'gseReactome'
+)
+
+use_prefix <- 'gse-dotplot'
+use_linewidth <- 1/2.141959
+root_section_number <- 4.2
+section_n <- 1
+subsection_n <- 1
+
+i <- names(gse_list)[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in names(gse_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        
+        x %<>% 
+          mutate(log10P = -log10(p.adjust)) %>% 
+          arrange(p.adjust) %>% 
+          head(30)
+        
+        res <- gse.dotplot(
+          x,
+          x = 'NES',
+          color = 'NES',
+          size = "log10P",
+          # color2log10 = TRUE,
+          showCategory = 30,
+          label_format = 60
+        ) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.3, 2.5)) +
+          scale_color_gradient2(trans = "reverse") +
+          scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+          labs(
+            size = expression(paste("lo", g[10],"(Adjusted P value)")),
+            caption = 'Showing only top-30 gene sets\nNES = Normalized Enrichment Score'
+            # size = 'Gene set\nsize'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = use_linewidth/2),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = use_linewidth/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm")
+          )
+        
+        subchunkify(res, 
+                    fig.width = 3.5, 
+                    fig.height = (3.5*0.3) + nrow(x)*0.05,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+### Gene-set similarity matrix by gene set collection
+```{r gse-jcmatrix-comparisons-conf, echo=FALSE}
+
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+)
+
+#
+# Generate a list of JC similarity matrices by gene-set
+#
+library(enrichplot)
+p_thrs <- 0.05
+topn <- 50
+use_comp <- names(gse_list)[1]
+jc_matrix_list <- foreach(use_comp = names(gse_list)) %do% {
+  data_gse <- foreach(sr = names(gse_collections)) %do% {
+    data_by_collection <- foreach(gc = gse_collections[[sr]])  %do% {
+      
+      if(sr == 'GSEA') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr == 'gseGO') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs & simplify) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        use_enrich_results <- gse_list[[use_comp]][[sr]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      
+      if(length(top_descriptions) > 1) {
+        use_enrich_results <- pairwise_termsim(
+          use_enrich_results, 
+          showCategory = use_n_categories, 
+          method = "JC")
+        use_enrich_results@termsim[top_descriptions, top_descriptions]
+      } else {
+        NULL
+      }
+    }
+    names(data_by_collection) <- gse_collections[[sr]]
+    return(compact(data_by_collection))
+  }
+  names(data_gse) <- names(gse_collections)
+  return(data_gse)
+}
+names(jc_matrix_list) <- names(gse_list)
+```
+
+Gene-set similarity matrix by comparison and gene set collections. Heatmap showing the pair-wise similarity matrix of top `r topn` gene sets with an adjusted P value < `r p_thrs` in each gene group. Heatmap colors represent the Jaccard similarity coefficient.
+
+
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-jcmatrix-comparisons, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+library(NbClust)
+
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseReactome = 'gseReactome'
+)
+
+use_prefix <- 'gse-jcmatrix-comparisons'
+use_linewidth <- 1/2.141959
+root_section_number <- 8.3
+section_n <- 1
+subsection_n <- 1
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+
+i <- names(jc_matrix_list)[1]
+for(i in names(jc_matrix_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  
+  section_n <- section_n + 1
+  
+  for(sr in names(jc_matrix_list[[i]])) {
+    
+    for(gc in names(jc_matrix_list[[i]][[sr]])) {
+      use_mat <- jc_matrix_list[[i]][[sr]][[gc]]
+      if(nrow(use_mat) >= 10) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        
+        # Define number of clusters
+        use_max.nc <- ifelse(nrow(use_mat) <= 15, 5, round(nrow(use_mat) * 0.3))
+        nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                               min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                               index = 'silhouette')
+        
+        
+        n_split <- nbclust_res$Best.nc['Number_clusters']
+        
+        ht <- Heatmap(
+          use_mat,
+          name = 'Jaccard index',
+          column_split = n_split,
+          row_split = n_split,
+          column_title = NULL,
+          row_title = NULL,
+          row_names_gp = gpar(fontsize = 4),
+          col = col_fun,
+          show_column_dend = FALSE,
+          show_column_names = FALSE,
+          border = TRUE,
+          # top_annotation = ha_top,
+          heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                                      labels_gp = gpar(fontsize = 8)
+          ),
+          width = unit(7, "cm"),
+          
+          clustering_method_rows = "ward.D",
+          clustering_method_columns = "ward.D"
+          # clustering_distance_rows = function(x) as.dist(1 - x),
+          # clustering_distance_columns = function(x) as.dist(1 - x)
+        )
+        
+        subchunkify(draw(ht), 
+                    fig.width = 7.2,
+                    fig.height = (7.2*0.3) + nrow(use_mat)*0.15,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+### Dotplots grouped (complete)
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-comparisons, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped'
+use_linewidth <- 1/2.141959
+root_section_number <- 8.4
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+         
+        x %<>% 
+          mutate(
+            is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+            log10P = -log10(p.adjust)
+          ) %>% 
+          arrange(p.adjust) %>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group))
+        
+        # Duplicated descriptions
+        dup_descriptions <- x$Description[x$Description %>% duplicated]
+        if(length(dup_descriptions) > 0) {
+          x %<>% 
+            mutate(
+              gset_db = gsub("_.*", "", ID),
+              Description = ifelse(
+                Description %in% dup_descriptions, 
+                paste0(Description," (", gset_db,")"), 
+                Description)
+            )
+        }
+        
+        group_levels <- x %>% 
+          group_by(Group) %>%
+          summarise(median_NES = median(NES)) %>% 
+          arrange(desc(median_NES)) %>% 
+          pull(Group)
+        
+        res <- x %>% 
+          mutate(
+            Group = factor(
+              default_labeller(20)(Group), 
+              levels = default_labeller(20)(group_levels)),
+            Description = fct_reorder(Description, NES)
+          ) %>%
+          ggplot(aes(x = NES, y = Description, fill = NES, size = log10P, stroke = linewidth_default/2)) +
+          geom_point(pch = 21, aes(color = is.sign)) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.8, 2)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_color_manual(values = c(no = 'white', yes = 'black')) +
+          scale_y_discrete(labels = default_labeller(80))+
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          facet_grid(rows = vars(Group), scales = 'free_y', space = 'free_y') +
+          labs(
+            y = '',
+            size = expression(paste("lo", g[10],"(Adjusted P value)")),
+            color = 'FDR < 0.05',
+            caption = paste0('Showing only top-', nrow(x),' gene sets\nNES = Normalized Enrichment Score')
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_text(angle = 0, hjust = 0, size = 4),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm"),
+            
+            panel.spacing=unit(0.1, "lines")
+          )
+          
+       n_gsets <- x$ID %>% unique() %>% length()
+       # use_width <-  7.2 + n_gsets * 0.02
+       use_width <- 4.2
+       # use_asp <-  0.318 + n_gsets * 0.017
+       # use_asp <-  n_gsets * 0.05
+       use_asp <-  n_gsets * 0.021
+       use_height <- use_width * use_asp
+        
+       subchunkify(res,
+                   fig.width = use_width,
+                   fig.height = use_height,
+                   dpi = 600,
+                   prefix = use_prefix,
+                   suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+### Dotplots grouped (unnamed)
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-comparisons-unnamed, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped-unnamed'
+root_section_number <- 8.5
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+
+        x %<>% 
+          mutate(
+            is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+            log10P = -log10(p.adjust)
+          ) %>% 
+          arrange(p.adjust) %>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group)) %>% 
+          group_by(Description) %>% 
+          # For entries with duplicated Description, keep only one based on min P-value
+          # slice_min(pvalue, n =1 , with_ties = FALSE) %>% 
+          ungroup()
+                
+        # Duplicated descriptions
+        dup_descriptions <- x$Description[x$Description %>% duplicated]
+        if(length(dup_descriptions) > 0) {
+          x %<>% 
+            mutate(
+              gset_db = gsub("_.*", "", ID),
+              Description = ifelse(
+                Description %in% dup_descriptions, 
+                paste0(Description," (", gset_db,")"), 
+                Description)
+            )
+        }
+        
+        group_levels <- x %>% 
+          group_by(Group) %>%
+          summarise(median_NES = median(NES)) %>% 
+          arrange(desc(median_NES)) %>% 
+          pull(Group)
+        
+        res <- x %>% 
+          mutate(
+            Group = factor(
+              default_labeller(20)(Group), 
+              levels = default_labeller(20)(group_levels)),
+            Description = fct_reorder(Description, NES)
+          ) %>%
+          ggplot(aes(x = NES, y = Description, fill = NES, size = log10P)) +
+          geom_point(pch = 21, aes(color = is.sign), stroke = linewidth_default/2) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.5, 1.1)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_color_manual(values = c(no = 'white', yes = 'black')) +
+          scale_y_discrete(labels = default_labeller(80))+
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          facet_grid(rows = vars(Group), scales = 'free_y', space = 'free_y') +
+          labs(
+            x = '',
+            y = '',
+            size = expression(paste("lo", g[10],"(FDR)")),
+            color = 'FDR\n< 0.05'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_blank(),
+            strip.text.x = element_blank(),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+            axis.text.y = element_blank(),
+            axis.text.x = element_blank(),
+            
+            legend.text = element_text(size = 3), 
+            legend.title = element_text(size = 3),
+            legend.key.width = unit(0.1, "cm"),
+            legend.key.height = unit(0.1, "cm"),
+            
+            panel.spacing=unit(0.1, "lines"),
+            plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches")
+          )
+        
+        n_gsets <- x$ID %>% unique() %>% length()
+        n_gsgroups <- 1
+        
+        
+        
+        # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+        # nmodels <- x$model %>% unique() %>% length()
+        nmodels <- 2
+        
+        # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+        # use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        
+        # Calculate height: top margin + tickmarks + bottom margin and legend
+        use_height <- 0.0217 + 0.0217 + n_gsets * 0.0492 + (0.035*(nmodels - 1)) + 0.4984
+        subchunkify(res +
+                      guides(
+                        size  = guide_legend(direction = "vertical",
+                                             keyheight = unit(0.0289, "inches"),
+                                             keywidth = unit(0.0289, "inches")
+                        ),
+                        color = "none",
+                        fill  = "none"
+                        # color = guide_legend(direction = "vertical"),
+                        # fill  = guide_colourbar(direction = "vertical")
+                      ) +
+                      theme(
+                        legend.position = "bottom",
+                        legend.box = "horizontal"
+                      ),
+                    fig.width = use_width,
+                    fig.height = use_height,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+        
+        # Print legend
+        res_legend <- get_legend(
+          res +
+            guides(
+              color = guide_legend(direction = "vertical"),
+              size  = guide_legend(direction = "vertical"),
+              fill  = guide_colourbar(direction = "vertical")
+            ) +
+            theme(
+              legend.position = "bottom",
+              legend.box = "horizontal"
+            )
+        )
+        subchunkify(plot_grid(res_legend),
+                    fig.width = 1.8,
+                    fig.height = 1,
+                    dpi = 600,
+                    prefix = paste0(use_prefix,'-legend-unnamed'),
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+### Dotplots simplified (complete)
+
+Here we show a single point for each group. 
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-simplified, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped-simplified'
+root_section_number <- 8.6
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+         
+        
+        x %<>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group))
+        
+        x_median <- x %>% 
+          group_by(Group) %>% 
+          summarise(
+            group_n = n(),
+            group_nes = median(NES)
+          ) %>% 
+          mutate(
+            group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+          ) %>% 
+          arrange(group_nes)
+        
+        x_simplified <- x %>% 
+          left_join(x_median) %>% 
+          filter(.sign == group_sign) %>% 
+          group_by(Group) %>%
+          slice_min(p.adjust, n = 1, with_ties = FALSE) %>% 
+          mutate(
+            log10P = -log10(p.adjust)
+          ) %>% 
+          ungroup
+        
+
+        res <- x_simplified %>% 
+          mutate(
+            # Group = factor(
+            #   Group, 
+            #   levels = x_median$Group)
+            Group = fct_reorder(Group, NES)
+          ) %>%
+          ggplot(aes(x = NES, y = Group, fill = NES, size = log10P)) +
+          geom_point(pch = 21, color = 'black') +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.8, 2)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_y_discrete(labels = default_labeller(80))+
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          labs(
+            y = '',
+            size = expression(paste("lo", g[10],"(Adjusted P value)"))
+            # caption = 'NES = Normalized Enrichment Score'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_text(angle = 0, hjust = 0, size = 4),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm"),
+            
+            panel.spacing=unit(0.1, "lines")
+          )
+        
+       #    
+       n_gsets <- x_simplified$Group %>% unique() %>% length()
+       # use_width <-  7.2 + n_gsets * 0.02
+       use_width <- 2.8
+       # use_asp <-  0.318 + n_gsets * 0.017
+       # use_asp <-  n_gsets * 0.05
+       use_asp <-  n_gsets * 0.051
+       use_height <- use_width * use_asp
+
+       subchunkify(res,
+                   fig.width = use_width,
+                   fig.height = use_height,
+                   dpi = 600,
+                   prefix = use_prefix,
+                   suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+
+### Dotplots simplified (unnamed)
+
+Here we show a single point for each group. 
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-simplified-unnamed, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped-simplified-unnamed'
+root_section_number <- 8.7
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+         
+        
+        x %<>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group))
+        
+        x_median <- x %>% 
+          group_by(Group) %>% 
+          summarise(
+            group_n = n(),
+            group_nes = median(NES)
+          ) %>% 
+          mutate(
+            group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+          ) %>% 
+          arrange(group_nes)
+        
+        x_simplified <- x %>% 
+          left_join(x_median) %>% 
+          filter(.sign == group_sign) %>% 
+          group_by(Group) %>%
+          slice_min(p.adjust, n = 1, with_ties = FALSE) %>% 
+          mutate(
+            log10P = -log10(p.adjust)
+          ) %>% 
+          ungroup
+        
+        
+        
+        res <- x_simplified %>% 
+          mutate(
+            # Group = factor(
+            #   Group, 
+            #   levels = x_median$Group)
+            Group = fct_reorder(Group, NES)
+          ) %>%
+          ggplot(aes(x = NES, y = Group, fill = NES, size = log10P)) +
+          geom_point(pch = 21, color = 'black') +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.8, 2)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          labs(
+            x = '',
+            y = '',
+            size = expression(paste("lo", g[10],"(Adjusted P value)"))
+            # caption = 'NES = Normalized Enrichment Score'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_blank(),
+            strip.text.x = element_blank(),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+            axis.text.y = element_blank(),
+            axis.text.x = element_blank(),
+            
+            legend.text = element_text(size = 3), 
+            legend.title = element_text(size = 3),
+            legend.key.width = unit(0.1, "cm"),
+            legend.key.height = unit(0.1, "cm"),
+            
+            plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches")
+          )
+        
+        
+        n_gsets <- x$Group %>% unique() %>% length()
+        
+        # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+        # nmodels <- x$model %>% unique() %>% length()
+        nmodels <- 2
+        
+        # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+        # use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        
+        # Calculate height: top margin + tickmarks + bottom margin and legend
+        use_height <- 0.0217 + 0.0217 + (n_gsets*1.75) * 0.0492 + (0.035*(nmodels - 1)) + 0.4984
+        subchunkify(res +
+                      guides(
+                        size  = guide_legend(direction = "vertical",
+                                             keyheight = unit(0.0289, "inches"),
+                                             keywidth = unit(0.0289, "inches")
+                        ),
+                        color = "none",
+                        fill  = "none"
+                        # color = guide_legend(direction = "vertical"),
+                        # fill  = guide_colourbar(direction = "vertical")
+                      ) +
+                      theme(
+                        legend.position = "bottom",
+                        legend.box = "horizontal"
+                      ),
+                    fig.width = use_width,
+                    fig.height = use_height,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+        
+        # Print legend
+        res_legend <- get_legend(
+          res +
+            guides(
+              color = guide_legend(direction = "vertical"),
+              size  = guide_legend(direction = "vertical"),
+              fill  = guide_colourbar(direction = "vertical")
+            ) +
+            theme(
+              legend.position = "bottom",
+              legend.box = "horizontal"
+            )
+        )
+        subchunkify(plot_grid(res_legend),
+                    fig.width = 1.8,
+                    fig.height = 1,
+                    dpi = 600,
+                    prefix = paste0(use_prefix,'-legend-unnamed'),
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+
+
+## Spatial distribution
+```{r bc-caf-spatial}
+# Add distance to CAF spots
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(caf_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  mutate(
+    caf_dist_cat = 'intermediate',
+    caf_dist_cat = ifelse(
+      r_dist_caf_hotspot_3d_transformed < 100, 'l100um',
+      caf_dist_cat
+    ),
+    caf_dist_cat = ifelse(
+      r_dist_caf_hotspot_3d_transformed > 1000, 'u1000um',
+      caf_dist_cat
+    ),
+    caf_dist_cat_4 = ifelse(r_dist_caf_hotspot_3d_transformed <= 0,
+                            'CAF',
+                            caf_dist_cat),
+    caf_dist_cat = factor(caf_dist_cat),
+    caf_dist_cat_4 = factor(caf_dist_cat_4)
+  )
+
+use_palette <- c(CAF = '#E69F00',
+                intermediate =  'grey80',
+                 l100um =  '#B5DFFD', 
+                 u1000um = '#A40905')
+
+i <- names(seu@images)[3]
+for(i in names(seu@images)) {
+  cat('###' , i, '\n')
+  plot_list <- list()
+  if(!is.null(seu@images[[i]])) {
+    plot_list[['caf_dist_cat']] <-
+      SpatialDimPlot(
+        seu,
+        group.by = 'caf_dist_cat',
+        image.alpha = 0.5,
+        pt.size.factor = 3,
+        images = i
+      ) +
+      scale_fill_manual(values = use_palette) +
+      labs(
+        fill = "",
+        title = 'Distance from CAF hotspots'
+      )
+    plot_list[['caf_dist_cat_4']] <-
+      SpatialDimPlot(
+        seu,
+        group.by = 'caf_dist_cat_4',
+        image.alpha = 0.5,
+        pt.size.factor = 3,
+        images = i
+      ) +
+      scale_fill_manual(values = use_palette) +
+      labs(
+        fill = "",
+        title = 'Distance from CAF hotspots'
+      )
+  } else {
+    plot_list[['caf_dist_cat']] <- plot_spacer()
+    plot_list[['caf_dist_cat_4']] <- plot_spacer()
+  }
+  print(wrap_plots(plot_list))
+  cat("\n\n")
+}
+```
+

@@ -64,20 +64,6 @@ sample_type_barcode_palette <- c(
 )
 
 
-donor_palette =c(
-  `KPC GL` = "#98DF8A",
-  `KPC Thy1.1` = "#FF9E4A",
-  Luz_PDAC_005 = "#729ECE",
-  Luz_PDAC_007 = "#FF9E4A",
-  H_PDAC_6PV = "#67BF5C",
-  H_PDAC_13PV = "#ED665D",
-  H_PDAC_16PV = "#AD8BC9",
-  H_PDAC_17PV = "#A8786E",
-  `Panc-1` = "#CC79A7",
-  `PC35` = "#56B4E9",
-  `PDAC-3` ="#E69F00"
-)
-
 bc_group_palette = c(
   `CTC` = "#ff7b7b",
   `ST` = "#B5DFFD",
@@ -94,6 +80,7 @@ bc_group_cluster_palette = c(
   `CTC2` = "#F4A3A3",
   `CTC3` = "#AD8BC9",
   `ST` = "#B5DFFD",
+  `PT ref` = "#B5DFFD",
   CAF = '#E69F00',
   `CTC1_CAF` = '#f59342',
   `CTC2_CAF` = '#E7B800',
@@ -101,28 +88,3 @@ bc_group_cluster_palette = c(
   `ST_CAF` = '#c19ce6',
   other = '#e5e5e5'
 )
-
-
-# bc_group_cluster_palette = c(
-#   `CTC1` = "#FC4E07",
-#   `CTC2` = "#E7B800",
-#   `CTC3` = "#AD8BC9",
-#   `ST` = "#B5DFFD",
-#   CAF = 'black',
-#   `CTC1_CAF` = '#f59342',
-#   `CTC2_CAF` = '#E7B800',
-#   `CTC3_CAF` = '#c19ce6',
-#   `ST_CAF` = '#c19ce6'
-# )
-
-# bc_group_cluster_palette = c(
-#   `CTC1` = "#ff7b7b",
-#   `CTC2` = "#ff0000",
-#   `CTC3` = "#AD8BC9",
-#   `ST` = "#CCCCCC",
-#   CAF = 'black',
-#   `CTC1_CAF` = '#E7B800',
-#   `CTC2_CAF` = '#f59342',
-#   `CTC3_CAF` = '#c19ce6',
-#   `ST_CAF` = 'grey50'
-# )

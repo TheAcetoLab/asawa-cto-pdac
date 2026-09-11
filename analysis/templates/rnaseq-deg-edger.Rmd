@@ -1,0 +1,669 @@
+<!-- To be compatible with workflowr, we need to specify the absolute directory under which the plots are generated, otherwise they will be saved into figure/<basename>.Rmd/<chunk-name>.<extension. and not visible in the html document: https://github.com/workflowr/workflowr/issues/111 -->
+```{r template-options, include = FALSE}
+library(ggbeeswarm)
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+```
+
+
+## Download results
+
+<!-- Write DGE results to xlsx file -->
+```{r write-dge-xlsx}
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+file_xlsx <- file.path('./docs/file',rmd_file, 'dge.xlsx')
+
+dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+
+# Generate workbook
+wb <- createWorkbook()
+for(i in names(dge_list)) {
+  addWorksheet(wb, i)
+  res <- dge_list[[i]]$results %>% 
+    dplyr::select(feature, gene_name, mean, detected, logFC, PValue, FDR)
+  writeData(wb, i, res)
+}
+saveWorkbook(wb, file_xlsx, TRUE)
+
+dge_file_xlsx <- file_xlsx
+```
+
+<!-- Write GSE results to xlsx file -->
+```{r write-gse_list-xlsx}
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols),
+  gseGO = c("BP", "MF")
+)
+
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+for(sr in names(gse_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in gse_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('gse_', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      addWorksheet(wb, i)
+      if(!is.null(gse_list[[i]][[sr]][[gc]])) {
+        res <- gse_list[[i]][[sr]][[gc]]@result
+        writeData(wb, i, res)
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Change dge_list names after writing to xlsx -->
+```{r change-dge-names}
+comp_names <- comp_list_description$comparison_long %>% 
+  set_names(comp_list_description$comparison)
+names(comp_list) <- comp_names[names(comp_list)]
+names(dge_list) <- comp_names[names(dge_list)]
+names(gse_list) <- comp_names[names(gse_list)]
+```
+
+
+The tables of results can be downloaded using the following links:
+
+- [**Differential gene expression**](`r gsub("docs/", "" , dge_file_xlsx)`)
+<!-- Write links to download GSE results -->
+```{r write-links, echo = FALSE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'GSEA') {
+      cat(paste0("- [**Gene set enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'gseGO') {
+      cat(paste0("- [**Gene set enrichment analysis: GO:", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+## Differential gene expression analysis
+
+### Download results
+
+- [**Differential gene expression**](`r gsub("docs/", "" , dge_file_xlsx)`)
+
+### Summary of results
+
+#### FDR distribution
+```{r dge-summary-fdr-dist}
+i <- names(dge_list[1])
+res <- foreach(i = names(dge_list), .combine = rbind) %do% {
+  x <- dge_list[[i]]$results
+  c(
+    `FDR < 0.1` = x %>% filter(FDR <= 0.1) %>% nrow,
+    `FDR < 0.05` = x %>% filter(FDR <= 0.05) %>% nrow,
+    `FDR < 0.01` = x %>% filter(FDR <= 0.01) %>% nrow,
+    `FDR < 0.001` = x %>% filter(FDR <= 0.001) %>% nrow,
+    `FDR < 0.0001` = x %>% filter(FDR <= 0.0001) %>% nrow
+  )
+}
+if(class(res)[1] == 'integer'){
+  res <- data.frame(res) %>% t() 
+}
+
+rownames(res) <- names(dge_list)
+res %>% 
+  data.frame(check.names = F) %>% 
+  rownames_to_column('comparison') %>% 
+  kbl(caption = 'Number of genes at different FDR thresholds') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+#### Number of genes at FDR 0.05
+```{r dge-summary-fdr-05}
+i <- names(dge_list[1])
+res <- foreach(i = names(dge_list), .combine = rbind) %do% {
+  x <- dge_list[[i]]$results %>% 
+    filter(FDR <= 0.05)
+  c(
+    `Up` = x %>% filter(logFC > 0) %>% nrow,
+    `Down` = x %>% filter(logFC < 0) %>% nrow
+  )
+}
+if(class(res)[1] == 'integer'){
+  res <- data.frame(res) %>% t() 
+}
+
+rownames(res) <- names(dge_list)
+res %>% 
+  data.frame(check.names = F) %>% 
+  rownames_to_column('comparison') %>% 
+  kbl(caption = 'Number of genes at at FDR < 0') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+
+
+### Volcano-plots
+Top-20 genes based on adjusted P-values are labeled.
+```{r dge-volcano-plot}
+i=names(dge_list)[1]
+p_thrs <- 0.05
+for(i in names(dge_list)) {
+  cat("#### Comparison:", i, "\n\n")
+  # cat(dge_list[[i]]$comparison, "\n\n")
+  x <- dge_list[[i]]$results
+  res <- plot.volcano(
+    x$logFC, 
+    x$FDR, 
+    label = x$gene_name, 
+    fill.palette = c("gray80", "red"), 
+    top.labels = 20, 
+    pval.thr = p_thrs, 
+    hline.color =  'grey60', hline.type = 2, hline.size = 0.5) +
+    geom_vline(xintercept = 0, linetype = 2, linewidth = 0.5, color = 'grey60')
+  print(res)
+  cat("\n\n")
+}
+```
+
+
+### Heatmaps
+```{r dge-heatmap-plot, fig.width=7.2, fig.asp = 1.8}
+i <- names(dge_list)[1]
+p_thrs <- 0.05
+lfc_thrs <- 1
+topn <- 50
+max_color_range <- 3 # put the color range to -3 to 3
+
+for(i in names(dge_list)) {
+  cat("#### Comparison", i, "\n\n")
+  use_comp <- comp_list[[i]]
+  
+  # Extract samples from comparisons
+  use_samples <- unlist(use_comp[1:2])
+  use_se <- se[,use_samples]
+  
+  # Arrange samples by condition (first control and then sample)
+  use_annot <- colData(use_se) %>% data.frame %>% 
+    mutate(
+      condition_new = ifelse(sample_alias %in% use_comp[[1]], 
+                             names(use_comp)[1], 
+                             names(use_comp)[2]),
+      condition_new = factor(condition_new, levels = names(use_comp)[2:1]),
+      condition_num = as.numeric(condition_new)
+    ) %>% 
+    arrange(condition_num, donor)
+  use_samples <- use_annot$sample_alias
+  
+  # Extract DGE results
+  use_dge <- dge_list[[i]]$results %>% 
+    filter(FDR < p_thrs & abs(logFC) > lfc_thrs) %>% 
+    mutate(direction = ifelse(logFC > 0, 'Up', 'Down')) %>% 
+    arrange(FDR) %>% 
+    head(topn) %>% 
+    arrange(logFC)
+  if(nrow(use_dge) > 50){
+    cat(paste0("Showing ", nrow(use_dge)," features with FDR < ", p_thrs, " and absolute log2 fold-change > ", lfc_thrs, "\n"))
+  } else {
+    cat(paste0("Only ", nrow(use_dge)," features with FDR < ", p_thrs, " and absolute log2 fold-change > ", lfc_thrs, ". Showing top-", topn," features based on P value and absolute log2 fold-change >", lfc_thrs,"\n"))
+    use_dge <- dge_list[[i]]$results %>% 
+      filter(abs(logFC) > lfc_thrs) %>% 
+      arrange(PValue) %>% 
+      mutate(direction = ifelse(logFC > 0, 'Up', 'Down')) %>% 
+      head(topn) %>% 
+      arrange(logFC)
+  }
+  
+  # Extract matrix of expression
+  mat <- assay(use_se, 'logcounts')[rownames(use_dge), use_samples]
+  rownames(mat) <- make.names(use_dge$gene_name, unique = TRUE)
+  zmat <- t(apply(mat, 1, scale, center = TRUE, scale = TRUE))
+  colnames(zmat) <- colnames(mat)
+  zmat <- zmat[,rownames(use_annot)]
+  
+  # Col Annotation
+  use_annot_levels <-levels(use_annot$condition_new)
+  column_ha <-  HeatmapAnnotation(
+    condition = anno_block(
+      # gp = gpar(fill = c('#fdbf6f', '#6a3d9a') %>% set_names(use_annot_levels)),
+      labels = use_annot_levels, 
+      labels_gp = gpar(col = "black", fontsize = 8)
+    ),
+    `Sample type` = use_annot$sample_type_grouped_3l,
+    `Mouse` = use_annot$mouse_id,
+    col = list(`Sample type` = sample_type_barcode_palette)
+  )
+    
+  # Row annotation (right)
+  row_annot_right <-  rowAnnotation(
+    log2FC = anno_numeric(
+      round(use_dge$logFC,1), 
+      labels_gp = gpar(fontsize = 6), 
+      bg_gp = gpar(
+        fill = c("#74add1", "#f46d43"), 
+        col = 'white'
+      ),
+      bar_width = unit(1, "npc") - unit(1.5, "pt")
+    ), 
+    annotation_name_rot = 0)
+  
+  # Row annotation (left)
+  direction_palette <- c('Up' = "#f46d43", 'Down' = "#74add1")
+  direction_palette <- direction_palette[names(direction_palette) %in% use_dge$direction]
+  
+  row_annot_left <-  rowAnnotation(
+    direction = anno_block(
+      gp = gpar(fill = direction_palette),
+      labels = names(direction_palette), 
+      labels_gp = gpar(col = "white", fontsize = 8)
+    )
+  )
+  
+  # Heatmap color
+  zmax <- zmat %>% abs %>% max
+  if(!is.null(max_color_range))
+    zmax <- max_color_range
+  col_fun <-  colorRamp2(
+    seq(-zmax, zmax, length.out = 11),
+    rev(brewer.pal(11, "RdBu"))
+  )
+  
+  # Generate Heatmap
+  htz <- Heatmap(
+    zmat,
+    name= 'z-score',
+    col = col_fun,
+    row_names_gp = gpar(fontsize = 8),
+    column_names_gp = gpar(fontsize = 8),
+    
+    top_annotation = column_ha,
+    column_split = use_annot$condition_num,
+    #cluster_column_slices = turn off the clustering on slices, and now you can precisely control the order of slices
+    cluster_column_slices = FALSE, 
+    column_title = NULL,
+    
+    right_annotation = row_annot_right,
+    row_split = use_dge$direction,
+    # left_annotation = row_annot_left,
+    row_title = NULL
+  )
+  
+  draw(
+    htz, 
+    # heatmap_legend_side = "bottom", 
+    annotation_legend_side = "bottom"
+  )
+    
+  cat("\n\n")
+  
+}
+```
+
+
+
+## Functional enrichment analysis
+```{r set-gsea-collections}
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols),
+  gseGO = c("BP", "MF")
+)
+
+```
+
+### Download results
+<!-- Write links to download GSE results -->
+```{r write-links-gse-2, echo = FALSE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'GSEA') {
+      cat(paste0("- [**Gene set enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'gseGO') {
+      cat(paste0("- [**Gene set enrichment analysis: GO:", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+### Summary of results
+```{r gse-summary-fdr}
+res <- foreach(i = names(gse_list), .combine = rbind) %do% {
+  foreach(sr = names(gse_collections), .combine = rbind) %do% {
+    foreach(gc = gse_collections[[sr]], .combine = rbind) %do% {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05)
+        if(gc == 'msigdb.c2.cp') {
+          x %<>% 
+            filter(grepl('REACTOME|KEGG|WP', ID))
+        }
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      c(
+        Comparison = i,
+        `Collection` = gc,
+        `Total` = nrow(x),
+        `Supressed` = x %>% filter(NES < 0) %>% nrow,
+        `Activated` = x %>% filter(NES > 0) %>% nrow
+      )
+    }
+  }
+}
+res <- res %>% data.frame(check.names = F)
+```
+
+#### Table
+```{r gse-summary-fdr-table}
+res %>% 
+  data.frame(check.names = F) %>% 
+  kbl(caption = 'Number of gene sets at FDR < 0.05',
+              row.names = F) %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), 
+              full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+#### Barplot
+```{r gse-summary-fdr-barplot, fig.asp = 1.3}
+res %>% 
+  pivot_longer(cols = c('Total', 'Supressed', 'Activated'), names_to = 'Direction', values_to = 'Count') %>% 
+  mutate(
+    comb_names = paste(Comparison, Collection),
+    Count = as.numeric(Count),
+    Comparison = gsub("-over-", " over\n", Comparison),
+    Comparison = gsub(" corrected", "\ncorrected", Comparison)
+    ) %>% 
+  ggplot(aes(Collection, Count, fill = Direction)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_grid(rows = vars(Comparison)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c(Supressed = '#74add1', 
+                               Activated = '#f46d43',
+                               Total = 'grey80')
+                    ) +
+  labs(x = '', fill = '') +
+  theme_facet +
+  theme(
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = one_pt/4, color = 'black'),
+    strip.text = element_text(size = 5)
+    
+  )
+```
+
+### Dotplots
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+use_linewidth <- 1/2.141959
+root_section_number <- 8.2
+section_n <- 1
+subsection_n <- 1
+
+for(i in names(gse_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+        if(gc == 'msigdb.c2.cp') {
+          x %<>% 
+            filter(grepl('REACTOME|KEGG|WP', ID))
+        }
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        
+        x %<>% 
+          mutate(log10P = -log10(p.adjust)) %>% 
+          arrange(p.adjust) %>% 
+          head(30)
+        
+        res <- gse.dotplot(
+          x,
+          x = 'NES',
+          color = 'NES',
+          size = "log10P",
+          # color2log10 = TRUE,
+          showCategory = 20,
+          label_format = 60
+        ) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.3, 2.5)) +
+          scale_color_gradient2(trans = "reverse") +
+          scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+          labs(
+            size = expression(paste("lo", g[10],"(Adjusted P value)")),
+            caption = 'Showing only top-30 gene sets\nNES = Normalized Enrichment Score'
+            # size = 'Gene set\nsize'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = use_linewidth/2),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", size = use_linewidth/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm")
+          )
+        
+        subchunkify(res, 
+                    fig.width = 3.5, 
+                    fig.height = (3.5*0.3) + nrow(x)*0.05,
+                    dpi = 600,
+                    prefix = 'gse-dotplot',
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+```
+
+
+
+### Gene-set similarity matrix
+
+```{r gse-jcmatrix-by-gset, echo=FALSE}
+#
+# Generate a list of JC similarity matrices by gene-set
+#
+library(enrichplot)
+p_thrs <- 0.05
+topn <- Inf
+use_comp <- names(gse_list)[1]
+jc_matrix_list <- foreach(use_comp = names(gse_list)) %do% {
+  data_gse <- foreach(sr = names(gse_collections)) %do% {
+    data_by_collection <- foreach(gc = gse_collections[[sr]])  %do% {
+      
+      if(sr == 'GSEA') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr == 'gseGO') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs & simplify) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        use_enrich_results <- gse_list[[use_comp]][[sr]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      
+      if(length(top_descriptions) > 1) {
+        use_enrich_results <- pairwise_termsim(
+          use_enrich_results, 
+          showCategory = use_n_categories, 
+          method = "JC")
+        use_enrich_results@termsim[top_descriptions, top_descriptions]
+      } else {
+        NULL
+      }
+    }
+    names(data_by_collection) <- gse_collections[[sr]]
+    return(compact(data_by_collection))
+  }
+  names(data_gse) <- names(gse_collections)
+  return(data_gse)
+}
+names(jc_matrix_list) <- names(gse_list)
+```
+
+
+Gene-set similarity matrix by comparison and gene set collections. Heatmap showing the pair-wise similarity matrix of top `r topn` gene sets with an adjusted P value < `r p_thrs` in each gene group. Heatmap colors represent the Jaccard similarity coefficient.
+
+```{r gse-jcmatrix-by-gset-heatmap, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+library(NbClust)
+
+root_section_number <- 6.5
+section_n <- 1
+subsection_n <- 1
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+i <- names(jc_matrix_list)[1]
+for(i in names(jc_matrix_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  
+  section_n <- section_n + 1
+  
+  for(sr in names(jc_matrix_list[[i]])) {
+    
+    for(gc in names(jc_matrix_list[[i]][[sr]])) {
+      use_mat <- jc_matrix_list[[i]][[sr]][[gc]]
+      if(nrow(use_mat) >= 10) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        
+        # Define number of clusters
+        use_max.nc <- ifelse(nrow(use_mat) <= 15, 5, round(nrow(use_mat) * 0.3))
+        nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                               min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                               index = 'silhouette')
+        
+        
+        n_split <- nbclust_res$Best.nc['Number_clusters']
+        
+        # ha_top <- HeatmapAnnotation(
+        #   foo = anno_block(
+        #     # labels = c("Translation", "Cell division"),
+        #     labels = 1:n_split,
+        #     labels_gp = gpar(col = "black", fontsize = 8),
+        #     gp = gpar(lwd = 0, lty = 0))
+        # )
+        # use_border <- ifelse(nrow(use_mat) > 30, FALSE, TRUE)
+        use_gap_size <- ifelse(nrow(use_mat) > 30, 0.2, 1)
+        use_border_lwd <- ifelse(nrow(use_mat) > 30, one_pt,one_pt/5)
+
+        ht <- Heatmap(
+          use_mat,
+          name = 'Jaccard index',
+          column_split = n_split,
+          row_split = n_split,
+          column_title = NULL,
+          row_title = NULL,
+          row_names_gp = gpar(fontsize = 4),
+          col = col_fun,
+          show_column_dend = FALSE,
+          show_column_names = FALSE,
+          border = TRUE,
+          border_gp = gpar(col = "black", lwd = use_border_lwd),
+          row_gap = unit(use_gap_size, "mm"),
+          column_gap = unit(use_gap_size, "mm"),
+          # top_annotation = ha_top,
+          heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                                      labels_gp = gpar(fontsize = 8)
+          ),
+          width = unit(7, "cm"),
+          
+          clustering_method_rows = "ward.D",
+          clustering_method_columns = "ward.D"
+          # clustering_distance_rows = function(x) as.dist(1 - x),
+          # clustering_distance_columns = function(x) as.dist(1 - x)
+        )
+        use_width <-  7.2 + nrow(use_mat) * 0.06
+        use_asp <-  0.618 + nrow(use_mat) * 0.05
+        use_height <- use_width * use_asp
+        subchunkify(draw(ht),
+                    fig.width = use_width,
+                    fig.height = use_height,
+                    dpi = 600,
+                    prefix = 'gse-jcmatrix-by-gset-heatmap',
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+```
+
+
+
+
+
+

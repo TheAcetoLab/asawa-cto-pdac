@@ -1,0 +1,386 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "Barcodes analysis - 3D analysis"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+---
+
+
+
+## Configuration
+
+Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+# library(DT)
+library(knitr)
+# library(patchwork)
+# library(kableExtra)
+# # library(cowplot)
+# # # library(colorblindr)
+library(RColorBrewer)
+# library(ggbeeswarm)
+# # library(ggrepel)
+library(magrittr)
+# library(UpSetR)
+# library(GGally)
+# library(openxlsx)
+library(ggpubr)
+# library(rstatix)
+library(arsenal)
+# #
+library(Seurat)
+library(SummarizedExperiment)
+library(semla)
+# library(edgeR)
+# library(DESeq2)
+# library(scuttle)
+# library(scran)
+# library(pheatmap)
+# library(PCAtools)
+# library(ComplexHeatmap)
+# library(circlize)
+
+library(plotly)
+library(dbscan)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+```
+
+
+## Data processing
+
+### Load initial data
+
+Load human seurat data
+```{r dw-load-seurat}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+
+# Change rownames
+rownames(seu@assays[['Spatial']]) <-  gsub('GRCh38-', '',rownames(seu@assays[['Spatial']]))
+
+i <- 'SCT'
+rownames(seu@assays[[i]]@counts) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@counts))
+rownames(seu@assays[[i]]@data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@data))
+rownames(seu@assays[[i]]@scale.data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@scale.data))
+seu@assays[[i]]@var.features <- gsub('GRCh38-', '', seu@assays[[i]]@var.features)
+```
+
+List of individual seurat files with full features
+```{r dw-list-seurat}
+seurat_files <- list.files(file.path(params$seurat_dir, "seurat"), pattern = "S[0-9]+.*.rds", full.names = TRUE)
+```
+
+Load barcode frequencies
+```{r dw-bc-ctc-spot-freq-combined-load}
+bc_spot_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_spot_freq.rds'))
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+```
+
+Load final data from barcode analysis report
+```{r dw-load-processed-data}
+bc_mat <- readRDS(file.path(params$seurat_dir, "seurat_bc", "bc_matrix.rds"))
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+seu_full_list <- readRDS(file.path(params$seurat_dir, "seurat", 'seurat_merged_list.rds'))
+seu_bc <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+
+# Load hotspot data
+hotspot_bc <- readRDS(file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+caf_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_caf_hotspot_2.rds"))
+caf_hotspot_r_dist <- readRDS(file.path(params$output_dir, 'caf/caf_hotspot_r_dist.rds'))
+```
+
+Add annotation to Seurat object
+```{r dw-add-annotation-seurat}
+# Add CAF rdist
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(caf_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+# Add CAF spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- caf_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$caf_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add hotspots defined based on barcodes. We use the same criteria as in chunk::dw-bc-hotspots-to-seurat
+st_spots <- hotspot_bc$st_specific %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+ctc_spots <- hotspot_bc$ctc_top %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+
+seu[[]] %<>% 
+  rownames_to_column('sample_spot') %>%
+  mutate(
+    bc_group = ifelse(sample_spot %in% st_spots, 'PT', ifelse(sample_spot %in% ctc_spots, 'CTC', 'other'))
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+
+# Change BC groups levels
+seu_bc[[]] %<>% 
+  mutate(
+    bc_group = ifelse(bc_group == 'ST', 'PT ref', bc_group),
+    bc_group_cluster = ifelse(bc_group_cluster == 'ST', 'PT ref', as.character(bc_group_cluster)),
+    bc_group_cluster = factor(bc_group_cluster, levels = c('PT ref', 'CTC1', 'CTC2'))
+  )
+
+```
+
+Create a Seurat object combining CAF hotspots and BC group annotation. We will use this Seurat object for the spatial distribution analysis.
+```{r dw-seurat-bc-caf}
+# Seurat object combining CAF and BC group annotation
+seu_bc_caf <- seu
+
+# Add bc_group_cluster information
+bc_group_cluster_spots <- seu_bc[[]] %>% rownames_to_column('sample_spot') %>% 
+  select(sample_spot, bc_group_cluster, clusters)
+
+# Rename groups
+seu_bc_caf[[]] %<>% 
+  rownames_to_column('sample_spot') %>% 
+  left_join(bc_group_cluster_spots) %>% 
+  mutate(
+    group_hotspots = paste(bc_group, caf_hotspots, sep = '_'),
+    group_hotspots = gsub("_NA", "", group_hotspots),
+    group_hotspots = gsub("NA_", "", group_hotspots),
+    group_hotspots = gsub("yes", "CAF", group_hotspots),
+    group_hotspots = gsub("other_CAF", "CAF", group_hotspots),
+    
+    group_hotspots_extended = paste(bc_group_cluster, caf_hotspots, sep = '_'),
+    group_hotspots_extended = gsub("_NA", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("NA_", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("yes", "CAF", group_hotspots_extended),
+    group_hotspots_extended = ifelse(group_hotspots_extended == 'NA', 'other', group_hotspots_extended)
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+# Remove spots with no annotation
+seu_bc_caf <- seu_bc_caf[,seu_bc_caf$group_hotspots !='other']
+```
+
+Modify coordinates
+```{r dw-add-xy-um}
+use_seu <- seu
+
+# Get pxl to microns conversion factor. We will use the median of the pixel spot diameter across the different slices to calculate the conversion factor, and we will use the physical spot diameter of 55 microns provided by 10x as reference for the conversion. 
+physical_spot_um <- 55
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+
+# Convert_coordinates
+xy_coord <- use_seu@tools$Staffli@meta_data %>%  
+  select(barcode, pxl_col_in_fullres_transformed, pxl_row_in_fullres_transformed) %>%
+  set_names(c('barcode', 'x', 'y')) %>% 
+  mutate(
+    x = x * um_per_pxl,
+    y = y * um_per_pxl
+  )
+
+xyz_coord <- use_seu[[]] %>% 
+  mutate(
+    z = z_um
+  ) %>% 
+  rownames_to_column('barcode') %>%
+  left_join(xy_coord, by = 'barcode') %>% 
+  dplyr::select(barcode, x, y ,z)
+
+# Add coordinates to seurat objects
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  # select(-z) %>%
+  left_join(xyz_coord, by = 'barcode') %>%
+  column_to_rownames('barcode')
+seu_bc[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  # select(-z) %>%
+  left_join(xyz_coord, by = 'barcode') %>%
+  column_to_rownames('barcode')
+seu_bc_caf[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  # select(-z) %>%
+  left_join(xyz_coord, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+```
+
+
+
+## 3D visualization
+```{r bc-group-3d}
+use_data <- seu[[]] %>% 
+  rownames_to_column('barcode') %>%
+  left_join(seu_bc[[]] %>% rownames_to_column('barcode') %>% select(barcode, bc_group_cluster), by = 'barcode')
+
+point_size <- 2
+use_palette <- bc_group_cluster_palette
+color_var <- 'bc_group_cluster'
+
+res_plot <- plot_ly()
+
+# Add NA points
+res_plot %<>%
+  add_markers(
+    data = use_data %>% filter(is.na(.[[color_var]])),
+    x = ~x, y = ~y, z = ~z,
+    name = 'Other',
+    marker = list(
+      color = 'black',
+      size = point_size,
+      opacity = 0.02
+    )
+  )
+
+# Add !NA points
+for(i in levels(use_data[[color_var]])) {
+  res_plot %<>% 
+    add_markers(
+      data = use_data %>% filter(.[[color_var]] == i),
+      x = ~x, y = ~y, z = ~z,
+      name = i,
+      marker = list(
+        color = use_palette[[i]],
+        size = point_size,
+        opacity = 0.5
+      )
+    ) 
+}
+
+
+res_plot %>% 
+  layout(legend= list(itemsizing='constant'), # keep the legend makers the same size
+         scene = list(
+           xaxis = list(showgrid = FALSE, zeroline = FALSE,
+                        showticklabels=FALSE, title = ''),
+           yaxis = list(showgrid = FALSE, zeroline = FALSE,
+                        showticklabels=FALSE, title = ''),
+           zaxis = list(showgrid = FALSE, zeroline = FALSE,
+                        showticklabels=FALSE, title = ''),
+           camera = list(
+             eye = list(x = 1.1, y = 1.1, z = 1.1)
+           )
+         )
+  ) 
+```
+
+
+
+
+## Hb synthesis score
+
+Values with an score <0.1 have an increased transparency.
+
+```{r rbc-score-3d}
+
+hb_ucell <- readRDS(file.path(params$seurat_dir, 'seurat_mm/ucell_hb_synthesis.rds'))
+
+# Add to seurat objects
+use_data <- seu[[]] %>% 
+  rownames_to_column('sample_barcode') %>%
+  left_join(hb_ucell, by = 'sample_barcode')
+
+point_size <- 2
+res_plot <- plot_ly()
+
+# Add 0 points
+res_plot %<>% 
+  add_markers(
+    data = use_data %>% filter(Hemoglobin_synthesis_UCell < 0.1),
+    x = ~x, y = ~y, z = ~z,
+    color = ~Hemoglobin_synthesis_UCell, 
+    colors = rev(brewer.pal(11, "Spectral")),
+    name = 'Hb-',
+    marker = list(
+      opacity = 0.1,
+      size = point_size
+    )
+  )
+
+# Add exprs > 0 points
+res_plot %<>% 
+  add_markers(
+    data = use_data %>% filter(Hemoglobin_synthesis_UCell >= 0.1),
+    x = ~x, y = ~y, z = ~z,
+    color = ~Hemoglobin_synthesis_UCell, 
+    colors = rev(brewer.pal(11, "Spectral")),
+    opacity = ~Hemoglobin_synthesis_UCell,
+    marker = list(
+      # opacity = 0.5,
+      size = 2
+    )
+  )
+
+res_plot %>% 
+  layout(
+    title = 'Hemoglobin synthesis score',
+    scene = list(
+      xaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      yaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      zaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = '')
+    )
+  )
+```

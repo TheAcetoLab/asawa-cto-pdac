@@ -1,0 +1,668 @@
+---
+title: "Overall survival in TCGA-PDAC3 project"
+subtitle: "CTC hotspots module genes in PDAC-3"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  data_dir: ./data/resources/UCSCXena/SummarizedExperiment
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3/seurat_hs/survival/bc_group_cluster
+  findmarkers_file: ./output/rnaseq-spatial/pdac3/seurat_hs/results_findMarkers_bc_group_cluster.rds
+  time_var: DSS.time
+  event_var: DSS
+  min_event_n: 3
+  min_surv_n: 20
+  max_time_years: 5
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(knitr)
+library(foreach)
+library(SummarizedExperiment)
+library(survival)
+library(gtsummary)
+library(ggsurvfit)
+library(survminer)
+library(meta)
+library(magrittr)
+library(GSVA)
+library(kableExtra)
+library(DT)
+```
+
+Load ggplot theme
+```{r ggplot-theme, include=TRUE}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+## Data wrangling
+
+Generate signatures based on CTC spatial distribution. Here we use the findMarkers results for each group (CTC1, CTC2 , and ST) in the spatial analysis of PDAC3. For each group,  gene signature was defined as top-100 genes upregulated in each group (FDR < 0.0001 and logFC > 1; genes ranked by FDR). 
+```{r gene-spatial-signatures-3g-generate}
+topn <- 100
+p_thresh <- 0.0001
+logfc_thresh <- 1
+min_pct_1 <- 0.10
+gene_sets <- list()
+
+chunk_suffix <- 'bc_group_cluster'
+dge_list <- readRDS(params$findmarkers_file)
+use_dge <-  dge_list[[1]]
+gene_sets <- foreach(use_dge = dge_list) %do% {
+  use_dge$result %>%
+    filter(pct.1 >= min_pct_1 ) %>% 
+    filter(p_val_adj < p_thresh & 
+             avg_log2FC > logfc_thresh) %>% 
+    arrange(p_val_adj) %>% 
+    head(topn) %>%
+    pull(gene)
+}
+names(gene_sets) <- names(dge_list)
+```
+
+Define list of projects
+<!-- https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/tcga-study-abbreviations -->
+```{r define-projects}
+# project_id <- list.files(
+#   path = params$data_dir, 
+#   pattern = 'TCGA-[A-Z]+.rds$'
+#   ) %>%
+#   gsub(".rds", "", .)
+# 
+# tcga_solid <- c('ACC', 'BLCA', 'BRCA', 'CESC', 'CHOL', 'COAD', 'ESCA', 'GBM', 
+#                   'HNSC', 'KICH', 'KIRC', 'KIRP', 'LGG', 'LIHC', 'LUAD', 'LUSC', 
+#                   'MESO', 'OV', 'PAAD', 'PCPG', 'PRAD', 'READ', 'SARC', 'SKCM', 
+#                   'STAD', 'TGCT', 'THCA', 'THYM', 'UCEC', 'UCS', 'UVM') %>% 
+#   paste('TCGA', ., sep = '-')
+# 
+# project_id <- intersect(project_id, tcga_solid)
+project_id <- 'TCGA-PAAD'
+```
+
+Generate signature score per patient
+```{r generate-signature-score, eval = FALSE}
+gsva_res <- foreach(i = project_id) %do% {
+  cat("###", i, "\n")
+  se <- readRDS(file.path(params$data_dir, paste0(i, '.rds')))
+
+  # Calculate CPM
+  cpm_mat <- scuttle::calculateCPM(se, assay.type = "normcounts")
+  logcpm_mat <- log2(cpm_mat + 1)
+  rm(cpm_mat)
+
+  # Remove duplicated samples: https://ucsc-xena.gitbook.io/project/how-do-i/how-do-i-remove-duplicate-samples-from-a-km-plot
+  #logcpm_mat <- logcpm_mat[, se$sample_type == 'Primary Tumor']
+
+  # Signature gene list
+  gene_sets_idx <- lapply(gene_sets, function(x) rownames(se)[rowData(se)$gene_name %in% x])
+
+  # Generate GSVA scores
+  gsva_params <- gsvaParam(logcpm_mat,
+                           gene_sets_idx,
+                           kcdf="Gaussian",
+                           maxDiff = TRUE)
+
+  gsva_res_i <- gsva(gsva_params)
+  
+  # saveRDS(gsva_res_i, file = file.path(params$output_dir, paste0(i,'_gsva.rds')))
+  rm(se)
+  rm(logcpm_mat)
+  gsva_res_i %>% t %>% data.frame(check.names = FALSE)
+}
+names(gsva_res) <- project_id
+saveRDS(gsva_res, file = file.path(params$output_dir, 'gsva_res.rds'))
+```
+
+Load GSVA results
+```{r load-gsva-res}
+gsva_res <- readRDS(file.path(params$output_dir, 'gsva_res.rds'))
+# use_data <- foreach(i = project_id) %do% {
+#   # Extract sample annotation and add gene expression and signature score
+#   se <- readRDS(file.path(params$data_dir, paste0(i, '.rds')))
+#   sample_annot <- colData(se) %>% data.frame %>% 
+#     bind_cols(gsva_res[[i]]) 
+#   rm(se)
+#   sample_annot
+# }
+# names(use_data) <- project_id
+```
+
+
+## Run survival analysis
+```{r conf-survival-analysis}
+selected_modules <- names(gene_sets)
+# project_id <- list.files(
+#   path = params$data_dir, 
+#   pattern = 'TCGA-[A-Z]+.rds$'
+#   ) %>%
+#   gsub(".rds", "", .)
+# 
+# tcga_solid <- c('ACC', 'BLCA', 'BRCA', 'CESC', 'CHOL', 'COAD', 'ESCA', 'GBM', 
+#                   'HNSC', 'KICH', 'KIRC', 'KIRP', 'LGG', 'LIHC', 'LUAD', 'LUSC', 
+#                   'MESO', 'OV', 'PAAD', 'PCPG', 'PRAD', 'READ', 'SARC', 'SKCM', 
+#                   'STAD', 'TGCT', 'THCA', 'THYM', 'UCEC', 'UCS', 'UVM') %>% 
+#   paste('TCGA', ., sep = '-')
+# 
+# project_id <- intersect(project_id, tcga_solid)
+project_id <- 'TCGA-PAAD'
+```
+
+```{r, eval = FALSE}
+foreach(i = project_id) %do% {
+   se <- readRDS(file.path(params$data_dir, paste0(i, '.rds')))
+  
+  # Remove duplicated samples: https://ucsc-xena.gitbook.io/project/how-do-i/how-do-i-remove-duplicate-samples-from-a-km-plot
+  sample_annot <- colData(se) %>% data.frame %>% 
+    filter(sample_type == 'Primary Tumor')
+  'Metastasis_nature2012' %in% names(sample_annot)
+  
+}
+```
+
+Load raw data. We set up the follow-up limit and configure survival variable. Remove studies with less than `r params$min_event_n` events and `r params$min_surv_n` patients with survival data
+```{r load-data, eval = FALSE}
+i <- project_id[1]
+data_se <- foreach(i = project_id) %do% {
+  se <- readRDS(file.path(params$data_dir, paste0(i, '.rds')))
+  
+  # Remove duplicated samples: https://ucsc-xena.gitbook.io/project/how-do-i/how-do-i-remove-duplicate-samples-from-a-km-plot
+  sample_annot <- colData(se) %>% data.frame %>% 
+    filter(sample_type == 'Primary Tumor')
+  
+  # sample_annot$Metastasis_Coded_nature2012 %>% table
+  # sample_annot$Metastasis_nature2012 %>% table
+  # sample_annot$distant_metastasis_present_ind2  %>% table
+  # sample_annot$metastatic_site_at_diagnosis  %>% table
+  # sample_annot$new_neoplasm_event_type %>% table
+  # sample_annot$pathologic_stage %>% table
+  
+  # Filter genes and samples
+  res <- se[, rownames(sample_annot)]
+  
+  # Set survival variables and follow up limit
+  sample_annot <- colData(res) %>% data.frame()
+  sample_annot$status <- sample_annot[[params$event_var]]
+  sample_annot$time <- sample_annot[[params$time_var]]/365.25
+    
+  sample_annot <- sample_annot %>% 
+    mutate(
+      status = ifelse(time >= params$max_time_years, 0, status),
+      time = ifelse(time >= params$max_time_years, params$max_time_years, time)
+    )
+  
+  # Add modules scores
+  sample_annot %<>% 
+    bind_cols(gsva_res[[i]][rownames(sample_annot),]) 
+  
+  # Add back colData
+  colData(res) <- DataFrame(sample_annot)
+    
+  # Number of events
+  n_surv_data <- sum(!is.na(res$status))
+  n_events <- sum(res$status, na.rm = TRUE)
+
+  if(ncol(res) > 0 & n_events >= params$min_event_n & n_surv_data >= params$min_surv_n) {
+    res
+  } else {
+    NULL
+  }
+}
+names(data_se) <- project_id
+
+# Remove NULL elements
+data_se <- compact(data_se)
+```
+
+Run survival analysis dichotonomous
+```{r run-survival-quantile-analysis, eval = FALSE}
+i <- project_id[3]
+surv_q3 <- foreach(i = names(data_se), .combine = rbind) %do% {
+  se <- data_se[[i]]
+  
+  # Add gene-expression data
+  g <- selected_modules[1]
+  foreach(g = selected_modules, .combine = rbind) %do% {
+    
+    # Generate clinical sample data with survival information
+    sample_annot <- colData(se) %>% data.frame()
+    sample_annot$ml_score <- sample_annot[[g]]
+    use_quantiles <- quantile(sample_annot[[g]], probs = c(0.33, 0.66), na.rm = FALSE)
+
+    # sample_annot$status <- sample_annot[[params$event_var]]
+    # sample_annot$time <- sample_annot[[params$time_var]]/365.25
+    sample_annot %<>% 
+      mutate(
+        gene_q = ifelse(ml_score >= use_quantiles[2], "T3", NA),
+        gene_q = ifelse(ml_score <= use_quantiles[1], "T1", gene_q)
+      ) %>% 
+      filter(!is.na(gene_q))
+    
+    # Set follow up limit
+    # sample_annot <- sample_annot %>% 
+    #   mutate(
+    #     status = ifelse(time >= params$max_time_years, 0, status),
+    #     time = ifelse(time >= params$max_time_years, params$max_time_years, time)
+    # )
+    
+    # Cox-PH results
+    cox.res <- coxph(Surv(time, status) ~ gene_q, data = sample_annot) %>%
+      tbl_regression(exp = TRUE)
+    
+    data.frame(
+        project_id = i,
+        module_name = g,
+        HR = cox.res$table_body$estimate[3],
+        p.value = cox.res$table_body$p.value[3],
+        std.error = cox.res$table_body$std.error[3],
+        conf.low = cox.res$table_body$conf.low[3],
+        conf.high = cox.res$table_body$conf.high[3],
+        n.low = sum(sample_annot$gene_q == "Q1"),
+        n.high = sum(sample_annot$gene_q == "Q2")
+      )
+  }
+
+}
+
+saveRDS(surv_q3, file = file.path(params$output_dir, 'surv_q3.rds'))
+
+```
+
+Generate survfit object for dichotonomous survival analysis
+```{r run-surfit-quantile-analysis, eval = FALSE}
+survfit_km_q3 <- foreach(i = names(data_se)) %do% {
+  se <- data_se[[i]]
+  
+  # Add gene-expression data
+  g <- selected_modules[1]
+  res_by_genes <- foreach(g = selected_modules) %do% {
+    # Extract gene expression data
+    gene_id <- rownames(se)[rowData(se)$gene_name == g]
+    gene_exp <- assay(se, 'logcounts')[gene_id,]
+    
+    # Generate clinical sample data with survival information
+    sample_annot <- colData(se) %>% data.frame()
+    sample_annot$ml_score <- sample_annot[[g]]
+    use_quantiles <- quantile(sample_annot[[g]], probs = c(0.33, 0.66), na.rm = FALSE)
+    # sample_annot$status <- sample_annot[[params$event_var]]
+    # sample_annot$time <- sample_annot[[params$time_var]]/365.25
+    sample_annot %<>% 
+      mutate(
+        gene_q = ifelse(ml_score >= use_quantiles[2], "T3", NA),
+        gene_q = ifelse(ml_score <= use_quantiles[1], "T1", gene_q)
+      ) %>% 
+      filter(!is.na(gene_q))
+    
+    # Set follow up limit
+    # sample_annot <- sample_annot %>% 
+    #   mutate(
+    #     status = ifelse(time >= params$max_time_years, 0, status),
+    #     time = ifelse(time >= params$max_time_years, params$max_time_years, time)
+    # )
+    
+    # KM plot
+    survfit2(Surv(time, status) ~ gene_q, data = sample_annot) %>% 
+      ggsurvfit() +
+      add_risktable() +
+      labs(
+        x = "Time (years)",
+        title = i
+      ) +
+      theme_project + 
+      theme(legend.position="bottom")
+  }
+  names(res_by_genes) <- selected_modules
+  res_by_genes
+
+}
+names(survfit_km_q3) <- names(data_se)
+saveRDS(survfit_km_q3, file = file.path(params$output_dir, 'survfit_km_q3.rds'))
+
+```
+
+Generate survfit object for dichotonomous survival analysis, combining all the signatures into a single plot
+```{r run-surfit-quantile-analysis-combined, eval = FALSE}
+survfit_km_combined_q3 <- foreach(i = names(data_se)) %do% {
+  se <- data_se[[i]]
+  
+  sample_annot <- colData(se) %>% data.frame()
+  # Add gene-expression data
+  g <- selected_modules[1]
+  
+  for(g in selected_modules){
+    gene_id <- rownames(se)[rowData(se)$gene_name == g]
+    gene_exp <- assay(se, 'logcounts')[gene_id,]
+    use_quantiles <- quantile(sample_annot[[g]], probs = c(0.33, 0.66), na.rm = FALSE)
+    
+    q_var <- paste0(g, "_q")
+    sample_annot[,q_var] <- ifelse(sample_annot[[g]]  >= use_quantiles[2], "T3", NA)
+    sample_annot[,q_var] <- ifelse(sample_annot[[g]]  <= use_quantiles[1], "T1", sample_annot[,q_var])
+  }
+  
+  q_vars <- paste0(selected_modules, "_q")
+  
+  df_long <- sample_annot %>%
+    pivot_longer(
+      cols = all_of(q_vars),
+      names_to = "predictor",
+      values_to = "group"
+    ) %>% 
+    mutate(
+      group = factor(group, levels = c("T1", "T3")),
+      predictor = gsub("_q", "", predictor)
+    ) %>% 
+    filter(!is.na(group))
+  
+  # Fit KM curve with interaction predictor:group
+  fit <- survfit(Surv(time, status) ~ predictor + group, data = df_long)
+  
+  return(
+    list(
+      fit = fit,
+      data = df_long
+    )
+  )
+}
+names(survfit_km_combined_q3) <- names(data_se)
+saveRDS(survfit_km_combined_q3, file = file.path(params$output_dir, 'survfit_km_combined_q3.rds'))
+
+```
+
+
+Generate survfit object for dichotonomous survival analysis, combining all the CTC signatures into a single plot
+```{r run-surfit-quantile-analysis-ctc-combined, eval = FALSE}
+use_modules <- c('CTC1', 'CTC2')
+survfit_km_ctc_combined_q3 <- foreach(i = names(data_se)) %do% {
+  se <- data_se[[i]]
+  
+  sample_annot <- colData(se) %>% data.frame()
+  # Add gene-expression data
+  g <- use_modules[1]
+  
+  for(g in use_modules){
+    gene_id <- rownames(se)[rowData(se)$gene_name == g]
+    gene_exp <- assay(se, 'logcounts')[gene_id,]
+    use_quantiles <- quantile(sample_annot[[g]], probs = c(0.33, 0.66), na.rm = FALSE)
+    
+    q_var <- paste0(g, "_q")
+    sample_annot[,q_var] <- ifelse(sample_annot[[g]]  >= use_quantiles[2], "T3", NA)
+    sample_annot[,q_var] <- ifelse(sample_annot[[g]]  <= use_quantiles[1], "T1", sample_annot[,q_var])
+  }
+  
+  q_vars <- paste0(use_modules, "_q")
+  
+  df_long <- sample_annot %>%
+    pivot_longer(
+      cols = all_of(q_vars),
+      names_to = "predictor",
+      values_to = "group"
+    ) %>% 
+    mutate(
+      group = factor(group, levels = c("T1", "T3")),
+      predictor = gsub("_q", "", predictor)
+    ) %>% 
+    filter(!is.na(group))
+  
+  # Fit KM curve with interaction predictor:group
+  fit <- survfit(Surv(time, status) ~ predictor + group, data = df_long)
+  
+  return(
+    list(
+      fit = fit,
+      data = df_long
+    )
+  )
+}
+names(survfit_km_ctc_combined_q3) <- names(data_se)
+saveRDS(survfit_km_ctc_combined_q3, file = file.path(params$output_dir, 'survfit_km_ctc_combined_q3.rds'))
+```
+
+
+Load survival data
+```{r load-survival-data}
+surv_q3 <- readRDS(file.path(params$output_dir, 'surv_q3.rds'))
+survfit_km_q3 <- readRDS(file.path(params$output_dir, 'survfit_km_q3.rds'))
+survfit_km_combined_q3 <- readRDS(file.path(params$output_dir, 'survfit_km_combined_q3.rds'))
+survfit_km_ctc_combined_q3 <- readRDS(file.path(params$output_dir, 'survfit_km_ctc_combined_q3.rds'))
+```
+
+Adapt survival data to be used with the template
+```{r adapt-survival-data}
+surv_q3 <- surv_q3 %>% 
+  select(-project_id) %>% 
+  dplyr::rename(project_id = module_name)
+```
+
+
+Run metanalysis for quantitative survival analysis
+<!-- https://bookdown.org/MathiasHarrer/Doing_Meta_Analysis_in_R/ -->
+```{r run-survival-quant-meta-analysis}
+## Survival with Q3 expression
+meta_surv_q3 <-  metagen(
+    HR = log(surv_q3$HR), 
+    lower = log(surv_q3$conf.low), 
+    upper = log(surv_q3$conf.high),
+    sm = "HR", fixed=F, random=T,
+    studlab = surv_q3$project_id,
+    method.tau = "DL", ## method to calculate Tau
+    method.random.ci = "classic" ## method to calculate estimator's CI
+  )
+
+x <- summary(meta_surv_q3)
+meta_surv_q3_summary <- x$data %>% 
+  mutate(
+    project_id = 'Summary',
+    gene_name = .studlab,
+    HR = exp(x$random$TE),
+    p.value = x$random$p,
+    std.error = x$random$seTE,
+    conf.low = exp(x$random$lower),
+    conf.high = exp(x$random$upper)
+  ) %>% 
+  select(
+    project_id, gene_name, HR, p.value, std.error, conf.low, conf.high
+  )
+
+meta_surv_q3_weight <- data.frame(
+    project_id = x$studlab,
+    gene_name = 'Module-Up',
+    w.random = round(100*x$w.random / sum(x$w.random), 1)
+  )
+
+```
+
+
+## Module scores
+
+### Genes included
+```{r m-gene-list}
+use_data <- foreach(i = names(gene_sets), .combine = rbind) %do% {
+  data.frame(module = i, gene = gene_sets[[i]])
+}
+use_data %>% datatable(., 
+          rownames = FALSE, 
+          filter = 'top', 
+          caption = 'Genes included for each module',
+          extensions = 'Buttons', 
+          options = list(
+            dom = 'Blfrtip',
+            buttons = c('csv', 'excel')
+          ))
+
+```
+
+
+## Quantile 33 versus 66
+
+Cox proportional-hazards model to assess the association between gene expression and overall survival (OS). Expression data was trichotomized into three quantiles (Q1, Q2, Q3) based on the 33rd and 66th percentiles.
+
+```{r coxph-q3-perm}
+chunk_prefix <-'q3'
+use_cox_data <- surv_q3
+use_meta <- meta_surv_q3
+```
+
+### Forest plot with ggplot simplified
+```{r q3-coxph-ggplot-forestplot-simplified, fig.width = 2, fig.asp = 0.4}
+chunk_data <- use_cox_data %>%
+  mutate(
+    project_id = factor(project_id, levels = c('CTC2', 'CTC1', 'ST'))
+  )
+
+project_ord <- chunk_data$project_id %>% levels
+  
+
+use_meta_sum <- summary(use_meta)
+
+meta_weight <- data.frame(
+  project_id = gsub("TCGA-", "", use_meta_sum$studlab),
+  w.fixed = use_meta_sum$w.fixed,
+  w.pct = 100* use_meta_sum$w.fixed / sum(use_meta_sum$w.fixed)
+)
+
+chunk_data %<>% left_join(meta_weight)
+
+
+chunk_data %<>%
+  mutate(
+    project_id = factor(project_id, levels= c('Total', '', project_ord)),
+    project_type = ifelse(project_id == 'Total', 'Total', 'Project'),
+    FDR = p.adjust(p.value, method = 'BH'),
+    logP = -log10(p.value),
+    logP = ifelse(logP > 10, 10 , logP),
+    logFDR = -log10(FDR),
+    logFDR = ifelse(logFDR > 10, 10 , logFDR)
+  )
+
+chunk_data %>%
+  ggplot(aes(HR, project_id,
+             # size = w.pct,
+             shape = project_type)
+         ) +
+  geom_point(size = 3) +
+  geom_linerange(aes(xmin=conf.low, xmax=conf.high), 
+                 linewidth = 1/2,
+                 show.legend = FALSE) +
+  geom_vline(xintercept = 1, linetype = 'dotted') +
+  scale_shape_manual(values = c(Project = 16, Total = 18)) +
+  scale_size_continuous(range = c(1, 3)
+                        # breaks = c(0.1, 0.5, 1, 2, 5, 10),
+                        ) +
+  scale_x_continuous(trans = 'log2',
+                     breaks = c(0.1, 0.5, 1, 2, 5, 10),
+                     labels = as.character(c(0.1, 0.5, 1, 2, 5, 10))) +
+  theme(
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  labs(
+    x = 'Hazard ratio',
+    y = ''
+    # size = expression(paste("-lo", g[10],"(P value)")),
+    # size = "Weight %",
+    ) +
+  guides(
+    shape = 'none'
+  )
+ 
+```
+
+
+### Kaplan-Meier curves
+
+#### CTC1
+```{r coxph-q3-km-CTC1, fig.asp = 1}
+g <- 'CTC1'
+km_list <- map(survfit_km_q3, g)
+print(km_list)
+cat("\n\n")
+```
+
+
+#### CTC2
+
+```{r coxph-q3-km-CTC2,fig.asp = 1}
+g <- 'CTC2'
+km_list <- map(survfit_km_q3, g)
+
+print(km_list)
+cat("\n\n")
+```
+
+
+#### ST
+
+```{r coxph-q3-km-ST,fig.asp = 1}
+g <- 'ST'
+km_list <- map(survfit_km_q3, g)
+print(km_list)
+cat("\n\n")
+```
+
+
+#### Combined CTC
+```{r coxph-q3-km-combined-ctc, fig.width = 3.5, fig.asp = 0.8}
+km_res <- survfit_km_ctc_combined_q3$`TCGA-PAAD`
+
+res <- ggsurvplot(
+  fit = km_res$fit,
+  data = km_res$data,
+  color = "predictor",            
+  linetype = "group",
+  linewidth = linewidth_default,
+  palette = bc_group_cluster_palette,
+  legend.title = "",
+  xlab = "Time",
+  ylab = "Survival Probability",
+  ggtheme = theme_project,
+  censor = FALSE,
+  risk.table = T,
+  tables.height = 0.40,
+  pval = TRUE, 
+  pval.size = geom_text_size,
+  fontsize = geom_text_size,
+  legend.size = geom_text_size
+) 
+
+res$plot <- res$plot + 
+  scale_linetype_manual(values = c(T3 = "solid", T1 = "dashed"))
+
+print(res)
+
+cat("\n\n")
+```

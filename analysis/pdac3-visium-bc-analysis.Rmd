@@ -1,0 +1,2949 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "Barcodes analysis"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+  ctc_met_bc_se_file: ./data/barcodes/pdac3-ctc-mets/se.rds
+  min_counts: 5
+  min_present_prop: 0.25
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2023.1.Hs
+  ncores: 4
+---
+
+
+
+## Configuration
+
+Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(knitr)
+library(patchwork)
+library(kableExtra)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(UpSetR)
+library(GGally)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(arsenal)
+library(Seurat)
+library(SummarizedExperiment)
+library(semla)
+library(edgeR)
+library(scran)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data processing 
+
+### Load initial data
+
+Load CTC barcodes SummarizedExperiment
+```{r dw-load-ctc-bc-se}
+ctc_met_bc_se <- readRDS(params$ctc_met_bc_se_file)
+ctc_met_bc_se <- ctc_met_bc_se[,ctc_met_bc_se$total_bc>0]
+assay(ctc_met_bc_se, 'cpm') <- edgeR::cpm(assay(ctc_met_bc_se, 'norm_counts'))
+assay(ctc_met_bc_se, 'logcpm') <- edgeR::cpm(assay(ctc_met_bc_se, 'norm_counts'), log = TRUE)
+
+colData(ctc_met_bc_se) <- colData(ctc_met_bc_se) %>% data.frame %>% 
+  mutate(
+    sample_type_grouped = ifelse(grepl('^ctc_cluster', sample_type), 'ctc_cluster', sample_type),
+    sample_type_grouped = ifelse(sample_type == 'ctc_single_pool', 'ctc_single', sample_type_grouped),
+    sample_type_grouped = ifelse(sample_type %in% c('liver', 'lung'), 'metastasis', sample_type_grouped),
+    use_anatomical_origin = ifelse(anatomical_origin == 'cardiac_puncture', 'blood', anatomical_origin),
+    sample_type_origin = paste(sample_type_grouped, use_anatomical_origin, sep = '-'),
+    sample_type_origin = gsub('-lung|-liver', '', sample_type_origin)
+  ) %>% 
+  DataFrame
+
+```
+
+Load human seurat data
+```{r dw-load-seurat}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+
+# Change rownames
+rownames(seu@assays[['Spatial']]) <-  gsub('GRCh38-', '',rownames(seu@assays[['Spatial']]))
+
+i <- 'SCT'
+rownames(seu@assays[[i]]@counts) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@counts))
+rownames(seu@assays[[i]]@data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@data))
+rownames(seu@assays[[i]]@scale.data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@scale.data))
+seu@assays[[i]]@var.features <- gsub('GRCh38-', '', seu@assays[[i]]@var.features)
+```
+
+List of individual seurat files with full features
+```{r dw-list-seurat}
+seurat_files <- list.files(file.path(params$seurat_dir, "seurat"), pattern = "S[0-9]+.*.rds", full.names = TRUE)
+```
+
+
+### Load processed data
+```{r dw-load-processed-data}
+bc_spot_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_spot_freq.rds'))
+bc_mat <- readRDS(file.path(params$seurat_dir, "seurat_bc", "bc_matrix.rds"))
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+seu_full_list <- readRDS(file.path(params$seurat_dir, "seurat", 'seurat_merged_list.rds'))
+seu_bc <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+
+# Load hotspot data
+hotspot_bc <- readRDS(file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+caf_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_caf_hotspot_2.rds"))
+caf_hotspot_r_dist <- readRDS(file.path(params$output_dir, "hotspots_tme", "caf_hotspot_r_dist.rds"))
+lyve1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_lyve1_hotspot_1.rds"))
+lyve1_hotspot_r_dist <- readRDS(file.path(params$output_dir, "hotspots_tme", 'lyve1_hotspot_r_dist.rds'))
+pecam1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_pecam1_hotspot_1.rds")) 
+pecam1_hotspot_r_dist <- readRDS(file.path(params$output_dir, "hotspots_tme", 'pecam1_hotspot_r_dist.rds'))
+```
+
+Add annotation to Seurat object
+```{r dw-add-annotation-seurat}
+# Add hotspots distances
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(caf_hotspot_r_dist, by = 'barcode') %>%
+  left_join(lyve1_hotspot_r_dist, by = 'barcode') %>%
+  left_join(pecam1_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+# Add CAF spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- caf_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$caf_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add Lyve1 spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- lyve1_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$lyve1_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add Pecam1 spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- pecam1_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$pecam1_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add hotspots defined based on barcodes. We use the same criteria as in chunk::dw-bc-hotspots-to-seurat
+st_spots <- hotspot_bc$st_specific %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+ctc_spots <- hotspot_bc$ctc_top %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+
+seu[[]] %<>% 
+  rownames_to_column('sample_spot') %>%
+  mutate(
+    bc_group = ifelse(sample_spot %in% st_spots, 'ST', ifelse(sample_spot %in% ctc_spots, 'CTC', 'other'))
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+```
+
+Create a Seurat object combining CAF hotspots and BC group annotation. We will use this Seurat object for the spatial distribution analysis.
+```{r dw-seurat-bc-caf}
+# Seurat object combining CAF and BC group annotation
+seu_bc_caf <- seu
+
+# Add bc_group_cluster information
+bc_group_cluster_spots <- seu_bc[[]] %>% rownames_to_column('sample_spot') %>% 
+  select(sample_spot, bc_group_cluster, clusters)
+
+# Add Acta2 expression
+# Rename groups
+seu_bc_caf[[]] %<>% 
+  rownames_to_column('sample_spot') %>% 
+  left_join(bc_group_cluster_spots) %>% 
+  mutate(
+    group_hotspots = paste(bc_group, caf_hotspots, sep = '_'),
+    group_hotspots = gsub("_NA", "", group_hotspots),
+    group_hotspots = gsub("NA_", "", group_hotspots),
+    group_hotspots = gsub("yes", "CAF", group_hotspots),
+    group_hotspots = gsub("other_CAF", "CAF", group_hotspots),
+    
+    group_hotspots_extended = paste(bc_group_cluster, caf_hotspots, sep = '_'),
+    group_hotspots_extended = gsub("_NA", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("NA_", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("yes", "CAF", group_hotspots_extended),
+    group_hotspots_extended = ifelse(group_hotspots_extended == 'NA', 'other', group_hotspots_extended)
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+# Remove spots with no annotation
+seu_bc_caf_full <- seu_bc_caf
+seu_bc_caf <- seu_bc_caf[,seu_bc_caf$group_hotspots !='other']
+```
+
+## Barcode dynamics
+
+### Barcodes in PT
+```{r bc-dinamics-stats}
+bc_counts_df <- bc_mat %>% 
+  colSums %>% 
+  data.frame %>% 
+  set_names('bc_count') %>% 
+  rownames_to_column('spot')
+
+use_bc <- bc_freq %>% filter(ctc_met_top10) %>% pull(bc)
+bc_counts_df_top10 <- bc_mat[use_bc,] %>% 
+  colSums %>% 
+  data.frame %>% 
+  set_names('bc_count_top10') %>% 
+  rownames_to_column('spot') 
+
+use_bc <- bc_freq %>% filter(!ctc_met_top10) %>% pull(bc)
+use_bc <- use_bc[use_bc %in% rownames(bc_mat)]
+bc_counts_df_other <- bc_mat[use_bc,] %>% 
+  colSums %>% 
+  data.frame %>% 
+  set_names('bc_count_other') %>% 
+  rownames_to_column('spot') 
+
+bc_counts_df %<>% 
+  left_join(bc_counts_df_top10, by = 'spot') %>% 
+  left_join(bc_counts_df_other, by = 'spot')
+
+res_tab <- rbind(
+  `Spots` = c(nrow(bc_counts_df), '100%'),
+  `Spots with barcodes (UMI≥1)` = c(
+    sum(bc_counts_df$bc_count >= 1),
+    paste0(round(100*sum(bc_counts_df$bc_count >= 1) / nrow(bc_counts_df), 2), '%')
+    ),
+  `Spots with top-10 barcodes (UMI≥1)` = c(
+    sum(bc_counts_df$bc_count_top10 >= 1),
+    paste0(round(100*sum(bc_counts_df$bc_count_top10 >= 1) / nrow(bc_counts_df), 2), '%')
+    ),  
+  `Spots with other barcodes (UMI≥1)` = c(
+    sum(bc_counts_df$bc_count_other >= 1),
+    paste0(round(100*sum(bc_counts_df$bc_count_other >= 1) / nrow(bc_counts_df), 2), '%')
+    )
+)
+res_tab %>% 
+  kbl(caption = "Number of PT spots with barcodes") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r bc-dinamics-stats-ctc-me}
+res_tab <- rbind(
+  `Number of bc detected in PT (UMI≥1)` = sum(bc_freq$n_spots >= 1),
+  `Number of PT bc detected in CTC or Mets (CPM≥1)` = bc_freq %>% filter(n_spots >= 1) %>% filter(ctc_single.cpm_total >= 1 | ctc_cluster.cpm_total>= 1 | cto.cpm_total >= 1 | metastasis.cpm_total >= 1) %>% nrow,
+  `Number of PT bc detected in CTC (CPM≥1)` = bc_freq %>% filter(n_spots >= 1) %>% filter(ctc_single.cpm_total >= 1 | ctc_cluster.cpm_total>= 1 | cto.cpm_total >= 1) %>% nrow,
+  `Number of PT bc detected in Mets (CPM≥1)` = bc_freq %>% filter(n_spots >= 1) %>% filter(metastasis.cpm_total >= 1) %>% nrow
+)
+res_tab %>% 
+  kbl(caption = "Number of PT barcodes detected in CTC and mets") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Barcode composition in PT, CTC, and mets
+
+The barplot below shows the composition of barcodes present in PT (≥1 spot), in PT, CTCs and Metastasis.
+```{r bc-dynamics-alluvial, fig.width = 1.5, fig.asp = 0.690}
+require(ggalluvial)
+use_bc_freq <- bc_freq %>% 
+  filter(n_spots > 0) %>% 
+  mutate(
+    in_ctc_freq = ctc_single.cpm_total >= 1 | ctc_cluster.cpm_total>= 1 | cto.cpm_total >= 1,
+    in_met_freq = metastasis.cpm_total >= 1,
+    in_total_freq = total.cpm_total >= 1
+  )
+
+use_data <- rbind (
+  data.frame(
+    group = 'PT',
+    `PT and CTC` = sum(use_bc_freq$in_ctc_freq & !use_bc_freq$in_met_freq),
+    `PT and mets` = sum(!use_bc_freq$in_ctc_freq & use_bc_freq$in_met_freq),
+    `PT, CTC and mets` = sum(use_bc_freq$in_ctc_freq & use_bc_freq$in_met_freq),
+    `PT only` = sum(!use_bc_freq$in_total_freq),
+    check.names = FALSE
+  ),
+  data.frame(
+    group = 'CTC',
+    `PT and CTC` = sum(use_bc_freq$in_ctc_freq  & !use_bc_freq$in_met_freq),
+    `PT and mets` = 0,
+    `PT, CTC and mets` = sum(use_bc_freq$in_ctc_freq & use_bc_freq$in_met_freq),
+    `PT only` = 0,
+    check.names = FALSE
+  ),
+  data.frame(
+    group = 'Mets',
+    `PT and CTC` = 0,
+    `PT and mets` = sum(!use_bc_freq$in_ctc_freq  & use_bc_freq$in_met_freq),
+    `PT, CTC and mets` = sum(use_bc_freq$in_ctc_freq & use_bc_freq$in_met_freq),
+    `PT only` = 0,
+    check.names = FALSE
+  )
+)  %>% 
+  pivot_longer(cols = -group, names_to = 'stratum', values_to = 'count') %>% 
+  group_by(group) %>% 
+  mutate(proportion = count/sum(count)) %>% 
+  mutate(
+    group = factor(group, levels = c('PT', 'CTC', 'Mets')),
+    stratum = factor(stratum, levels = c('PT only', 'PT, CTC and mets', 'PT and CTC', 'PT and mets'))
+  )
+  
+fill_palette <- c(
+  'PT only' = '#B6DFFD',
+  'PT, CTC and mets' = '#a40603',
+  'PT and CTC' = '#efe443',
+  'PT and mets' = '#8b69b6'
+)
+
+use_data %>% 
+  ggplot(aes(x = group, stratum = stratum, alluvium = stratum, y = proportion, fill = stratum)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.35, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = fill_palette) +
+  labs(
+    x = '',
+    y = 'Percentage',
+    fill = ''
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+```
+
+
+### Top-10 Barcode composition in PT, CTC, and mets
+The barplot below shows the composition of barcodes present in PT (≥1 spot) colored by top-10 barcode selection in CTCs or Metastasis. Here the Y-axis represent the proportion of the abundance. For PT it shows the proportion of all PT spots, using as denominator the total number of spots. For CTC and Mets the proportion is based on the total CPM for each category. In PT, a spot was classified as Top 10 if contains at least on Top 10 barode, or as Other if no Top 10 barcode was detected. 
+```{r bc-dynamics-top10-unique_spots-alluvial, fig.width = 1.5, fig.asp = 0.690}
+# Get number of spots for each BC group. If the spots contains both Top-10 and Other, classify it as Other
+pt_prop <- bc_counts_df %>% 
+  mutate(
+    stratum = ifelse(bc_count >= 1, 'Other', 'No BC'),
+    stratum = ifelse(bc_count_top10 >= 1, 'CTC barcodes', stratum)
+  ) %>% 
+  group_by(stratum) %>%
+  summarise(
+    proportion = n() / nrow(bc_counts_df)
+    ) %>% 
+  ungroup %>% 
+  mutate(group = 'PT') %>% 
+  select(group, proportion, stratum) %>% 
+  filter(stratum != 'No BC')
+
+# For BC present in ST, get frequency  in CTC and mets
+use_data <- bc_freq %>% 
+  filter(n_spots > 0) %>% 
+  group_by(ctc_met_top10) %>%
+  summarise(
+    # n_spots = sum(n_spots),
+    ctc_single.cpm_total = sum(ctc_single.cpm_total),
+    ctc_cluster.cpm_total = sum(ctc_cluster.cpm_total),
+    cto.cpm_total = sum(cto.cpm_total),
+    metastasis.cpm_total = sum(metastasis.cpm_total)
+  ) %>% 
+  mutate(
+    # PT = n_spots / nrow(seu[[]]),
+    ctc_total = ctc_single.cpm_total + ctc_cluster.cpm_total + cto.cpm_total,
+    CTC = ctc_total /sum(ctc_total),
+    Metastasis = metastasis.cpm_total / sum(metastasis.cpm_total)
+  )
+
+use_data %<>% 
+  select(ctc_met_top10, CTC, Metastasis) %>%
+  pivot_longer(cols = -ctc_met_top10, names_to = 'group', values_to = 'proportion') %>% 
+  mutate(
+    stratum = ifelse(ctc_met_top10, 'CTC barcodes', 'Other' )
+  ) %>% 
+  select(-ctc_met_top10)
+
+
+# Join data
+use_data_plot <- rbind(
+  pt_prop,
+  use_data
+) %>% 
+  mutate(
+    group = factor(group, levels = c('PT', 'CTC', 'Metastasis')),
+    stratum = factor(stratum, levels = c('Other', 'CTC barcodes'))
+  )
+
+
+
+use_data_plot %>% 
+  ggplot(aes(x = group, stratum = stratum, alluvium = stratum, y = proportion, fill = stratum)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.35, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = c(Other = 'grey70', `CTC barcodes` = '#A40905')) +
+  labs(
+    x = '',
+    y = 'Percentage',
+    fill = 'Barcode'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+```
+
+
+
+### Selection of top barcodes
+
+```{r bc-dynamics-top-barcodes, fig.width =2.3, fig.asp = 0.618}
+use_vars <- c(Total = 'total.cpm_total')
+
+i <- names(use_vars)[1]
+for(i in names(use_vars)) {
+  
+  i_var <- use_vars[i]
+  use_data <- bc_freq %>% 
+    filter(n_spots > 0 | .data[[i_var]] >= 1) %>% 
+    mutate(
+      stratum = ifelse(ctc_met_top10, 'CTC and Mets', 'Other' ),
+      stratum = ifelse(st_specific, 'PT ref', stratum )
+    )
+  
+  p <- ggplot(data = use_data %>% filter(!ctc_met_top10 & !st_specific), 
+              aes(x = n_spots, y = log2(.data[[i_var]] + 1), color = stratum)) +
+    geom_point(pch = 16, alpha = .3, size = 0.8) +
+    geom_point(data = use_data %>% filter(ctc_met_top10), pch = 16, alpha = .7, size = 0.8) +
+    geom_point(data = use_data %>% filter(st_specific), pch = 16, alpha = .7, size = 0.8) +
+    scale_x_continuous(
+      trans=scales::pseudo_log_trans(base = 10),
+      breaks = c(1, 10, 100, 1000, 10000)
+    ) +
+    scale_color_manual(values = c(Other = 'grey70', `CTC and Mets` = '#A40905', `PT ref` = '#0072B2')) +
+    labs(
+      x = 'Number of spots',
+      y = expression(Log[2]~(sum~CPM~+1)),
+      color = 'Barcode'
+    )
+  print(p)
+  cat("\n\n")
+  
+}
+
+```
+
+
+## Summary statistics for barcode groups and hotspots
+
+### BC group
+```{r bc_group-hotspots-summary-stats}
+use_data <- seu[[]] %>% 
+  mutate(
+    caf_hotspots = ifelse(is.na(caf_hotspots), 'no', caf_hotspots),
+    lyve1_hotspots = ifelse(is.na(lyve1_hotspots), 'no', lyve1_hotspots),
+    pecam1_hotspots = ifelse(is.na(pecam1_hotspots), 'no', pecam1_hotspots)
+  ) #%>% 
+  # filter(bc_group != 'other')
+res_tab <- tableby(
+  bc_group ~ nCount_Spatial + nFeature_Spatial + nCount_Spatial_hs_prop + 
+    nCount_Spatial_mt + nCount_Spatial_bc + nCount_Spatial_bc_prop + 
+    caf_hotspots + lyve1_hotspots + pecam1_hotspots + 
+    r_dist_caf_hotspot_2d + r_dist_caf_hotspot_3d_transformed +
+     r_dist_lyve1_hotspot_2d + r_dist_lyve1_hotspot_3d_transformed +
+     r_dist_pecam1_hotspot_2d + r_dist_pecam1_hotspot_3d_transformed, 
+  data = use_data,
+  control = tableby.control(total=FALSE)
+)
+summary(
+  res_tab, pfootnote=TRUE
+)
+```
+
+### BC group + Cluster
+```{r bc_group_cluster-hotspots-summary-stats}
+
+use_data <- seu_bc[[]] %>% 
+  rownames_to_column('barcode') %>%
+  left_join(seu[[]] %>% rownames_to_column('barcode') %>% select(barcode, caf_hotspots, lyve1_hotspots, pecam1_hotspots), by = 'barcode') %>%
+  mutate(
+    caf_hotspots = ifelse(is.na(caf_hotspots), 'no', caf_hotspots),
+    lyve1_hotspots = ifelse(is.na(lyve1_hotspots), 'no', lyve1_hotspots),
+    pecam1_hotspots = ifelse(is.na(pecam1_hotspots), 'no', pecam1_hotspots)
+  ) %>% 
+  filter(bc_group != 'other')
+
+res_tab <- tableby(
+  bc_group_cluster ~ nCount_Spatial + nFeature_Spatial + nCount_Spatial_hs_prop + 
+    nCount_Spatial_mt + nCount_Spatial_bc + nCount_Spatial_bc_prop + 
+    caf_hotspots + lyve1_hotspots + pecam1_hotspots + 
+    r_dist_caf_hotspot_2d + r_dist_caf_hotspot_3d_transformed +
+     r_dist_lyve1_hotspot_2d + r_dist_lyve1_hotspot_3d_transformed +
+     r_dist_pecam1_hotspot_2d + r_dist_pecam1_hotspot_3d_transformed, 
+  data = use_data,
+  control = tableby.control(total=FALSE)
+)
+summary(
+  res_tab, pfootnote=TRUE
+)
+
+```
+
+
+### BC group + Cluster + CAF
+```{r bc_group_cluster-caf-hotspots-summary-stats}
+
+use_data <- seu_bc_caf[[]] %>% 
+  # rownames_to_column('barcode') %>%
+  # left_join(seu[[]] %>% rownames_to_column('barcode') %>% select(barcode, caf_hotspots, lyve1_hotspots, pecam1_hotspots), by = 'barcode') %>%
+  mutate(
+    caf_hotspots = ifelse(is.na(caf_hotspots), 'no', caf_hotspots),
+    lyve1_hotspots = ifelse(is.na(lyve1_hotspots), 'no', lyve1_hotspots),
+    pecam1_hotspots = ifelse(is.na(pecam1_hotspots), 'no', pecam1_hotspots)
+  ) %>% 
+  filter(bc_group != 'other')
+
+res_tab <- tableby(
+  bc_group_cluster ~ nCount_Spatial + nFeature_Spatial + nCount_Spatial_hs_prop + 
+    nCount_Spatial_mt + nCount_Spatial_bc + nCount_Spatial_bc_prop + 
+    caf_hotspots + lyve1_hotspots + pecam1_hotspots + 
+    r_dist_caf_hotspot_2d + r_dist_caf_hotspot_3d_transformed +
+     r_dist_lyve1_hotspot_2d + r_dist_lyve1_hotspot_3d_transformed +
+     r_dist_pecam1_hotspot_2d + r_dist_pecam1_hotspot_3d_transformed, 
+  data = use_data,
+  control = tableby.control(total=FALSE)
+)
+summary(
+  res_tab, pfootnote=TRUE
+)
+```
+
+
+
+## Spatial distribution
+```{r bc-caf-spatial}
+# We will create subsets of Seurat objects with NA values for the annotation of interest, which will allow us to have transparent spots in the figures for those NA values. We will remove the subset objects at the end
+
+# Prepare color palette
+group_hotspots_extended_palette <- c(CAF =  'black',
+                                     CTC1 =  '#FC4E07', 
+                                     CTC1_CAF = 'green',
+                                     CTC2 =  '#E7B800', 
+                                     CTC2_CAF = 'orange',
+                                     ST = '#00AFBB', 
+                                     ST_CAF = 'purple' )
+
+
+i <- 'S8_B1_2_5_2_right'
+cat('###' , i, '\n')
+
+SpatialDimPlot(
+      seu_bc_caf_full,
+      group.by = 'group_hotspots_extended',
+      image.alpha = 0.5,
+      pt.size.factor = 3,
+      images = i
+    ) +
+      scale_fill_manual(values = bc_group_cluster_palette) +
+      labs(
+        fill = "",
+        title = "BC hotspots"
+      ) +
+      theme(
+        legend.text = element_text(size = 3),
+      )
+
+```
+
+
+## UMAP - dimensionality reduction
+
+
+Clusters
+```{r seurat-merged-umap-clusters, fig.width=4.2, fig.asp = 0.8}
+DimPlot(seu_bc, reduction = "umap", group.by = "clusters", alpha = 0.6, label = TRUE, raster = TRUE, pt.size = 2)
+```
+
+
+Hotspot type
+```{r seurat-bc-umap-bc_group, fig.width=4.2, fig.asp = 0.8}
+DimPlot(seu_bc, reduction = "umap", group.by = "bc_group", alpha = 0.6, raster = TRUE, pt.size = 2) +
+  scale_color_manual(values = bc_group_palette)
+```
+
+Hotspot group type
+```{r seurat-bc-umap-bc_group_cluster, fig.width=4.2, fig.asp = 0.8}
+use_seu <- seu_bc
+use_seu[[]] %<>% mutate(
+  bc_group_cluster = as.character(bc_group_cluster),
+  bc_group_cluster = ifelse(is.na(bc_group_cluster), 'other', bc_group_cluster),
+  bc_group_cluster = factor(bc_group_cluster, levels = c('CTC1', 'CTC2', 'ST', 'other'))
+)
+  
+DimPlot(use_seu, reduction = "umap", group.by = "bc_group_cluster", alpha = 0.6, raster = TRUE, pt.size = 2) +
+  scale_color_manual(values = bc_group_cluster_palette)
+rm(use_seu)
+```
+
+
+
+
+
+
+## Grouping of hotspots
+
+### Cluster tree
+Phylogenetic tree of clusters built with pseudobulk and similarity.
+```{r bc_group-clusters-tree, fig.width=7.2}
+PlotClusterTree(seu_bc)
+```
+
+### Distribution of CTC and ST hotspots across clusters
+
+Clusters were further grouped into groupd depending on the barcode content:
+
+- CTC1 : spots with CTC barcodes in clusters 0, 6, and 7
+
+- CTC2 : spots with CTC barcodes in clusters 1, 3, and 2
+
+- ST : spots with ST barcodes in clusters 4 and 5
+
+```{r bc_group-clusters, fig.width=5.2, fig.asp = 0.4}
+seu_bc[[]] %>% 
+  ggplot(aes(clusters.dr, fill = bc_group)) +
+  geom_bar(position = 'fill') +
+  scale_fill_manual(values = bc_group_palette)
+
+
+seu_bc[[]] %>% 
+  ggplot(aes(clusters.dr, fill = bc_group_cluster)) +
+  geom_bar(position = 'fill') +
+  scale_fill_manual(values = bc_group_cluster_palette)
+```
+
+### Barcode composition
+
+Barcode composition across the different CTC groups (CTC1 and CTC2). 
+```{r bc_group-bc-composition, fig.width=7.2}
+use_bc_id <- bc_freq %>% 
+  filter(ctc_met_top10) %>% 
+  pull(bc)
+
+# generate a long format dataframe with barcode, sample barcode and expression of the barcode in the sample barcode. We will use this dataframe to plot the distribution of expression of the barcodes across the different groups (CTC1, CTC2 and ST)
+use_data <- bc_mat[use_bc_id,] %>% 
+  data.frame(check.names = FALSE) %>% 
+  rownames_to_column('bc') %>%
+  pivot_longer(cols = -bc, names_to = 'sample_barcode', values_to = 'expr') %>% 
+  filter(sample_barcode %in% colnames(seu_bc)) %>%
+  filter(expr >= 2) %>% 
+  mutate(expr = log2(expr)) %>%
+  left_join(seu_bc[[]] %>% rownames_to_column('sample_barcode') %>% select(sample_barcode, bc_group_cluster), by = 'sample_barcode')
+
+# Generate summary statistics for the expression of the barcodes across the different groups (CTC1, CTC2 and ST)
+use_data_stats <- use_data %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(
+    n = n(),
+    median_expr = median(expr)
+  )
+```
+
+Barcode composition in PT.
+```{r bc_group-bc-composition-pt}
+top_bc_id <- bc_freq %>% 
+  filter(ctc_met_top10) %>% 
+  pull(bc)
+other_bc_id <- setdiff(rownames(bc_mat), top_bc_id)
+bc_mat_pt <- rbind(
+  bc_mat[top_bc_id,],
+  colSums(bc_mat[other_bc_id,])
+)
+rownames(bc_mat_pt) <- c(top_bc_id, 'Other')
+
+use_data_pt <- bc_mat_pt %>% 
+  data.frame(check.names = FALSE) %>% 
+  rownames_to_column('bc') %>%
+  pivot_longer(cols = -bc, names_to = 'sample_barcode', values_to = 'expr') %>% 
+  filter(expr >= 2) %>% 
+  mutate(
+    expr = log2(expr),
+    bc_group_cluster = 'PT'
+    )
+use_data_pt_stats <- use_data_pt %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(
+    n = n(),
+    median_expr = median(expr)
+  )
+```
+
+#### Barcode expression
+```{r bc_group-bc-composition-expression, fig.width=4.8, fig.asp = 0.618}
+bc_levels <- use_data %>% group_by(bc) %>% summarise(m_expr = median(expr), n = n()) %>% mutate(nm = m_expr *n) %>% arrange(desc(nm))  %>% pull(bc)
+use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels)
+  ) %>%
+  ggplot(aes(bc, expr, fill = bc_group_cluster)) +
+  geom_boxplot(linewidth = linewidth_default) +
+  # facet_wrap(~bc_group_cluster , scales = 'free_x') +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  theme_facet +
+  labs(
+    title = 'Expression of CTC barcodes across groups',
+    y = 'Log2 counts',
+    x = '',
+    fill = '',
+    caption = 'Each point represents a spot'
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1) 
+  )
+```
+
+#### Barcode composition barplot
+```{r bc_group-bc-composition-prop-barplot, fig.width = 2.5, fig.asp = 0.618}
+# bc_levels <- use_data %>% group_by(bc) %>% summarise(m_expr = median(expr), n = n()) %>% mutate(nm = m_expr *n) %>% arrange(desc(nm))  %>% pull(bc)
+# bc_levels <- use_data %>% group_by(bc) %>% summarise(sum = sum(expr), n = n()) %>% arrange(desc(sum))  %>% pull(bc)
+# Sort bc levels by abundance in CTC1 group
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+
+# Arrange by CTC/CTC2
+# bc_levels <- use_data %>% 
+#   filter(!is.na(bc_group_cluster)) %>% 
+#   group_by(
+#     bc, bc_group_cluster
+#   ) %>% 
+#   summarise(expr = sum(expr)) %>% 
+#   pivot_wider(names_from = bc_group_cluster, values_from = expr) %>% 
+#   mutate(
+#     fc = log2(CTC1/CTC2)
+#   ) %>% 
+#   arrange(desc(fc)) %>% 
+#   pull(bc)
+  
+
+use_data %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels)
+  ) %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  ggplot(aes(bc_group_cluster, fill = bc)) +
+  geom_bar(position = 'fill') +
+  labs(
+    title = 'Composition of barcodes in CTC1 and CTC2 spots',
+    y = 'Percentage of counts',
+    x = '',
+    fill = 'Barcode'
+  ) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = get_scater_palette('tableau20'))
+  
+```
+
+#### Barcode composition alluvial plot
+
+Alluvial Flow of Barcode Frequencies Across Groups
+
+##### All Categories
+
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, CTO, and Metastasis), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+
+```{r bc_group-bc-composition-prop-alluvial-allcat, fig.width = 3.2, fig.asp = 0.618}
+require(ggalluvial)
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+
+
+use_data_sum <- use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                ctc_single.cpm_total, 
+                ctc_cluster.cpm_total, 
+                cto.cpm_total, 
+                metastasis.cpm_total) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO',
+      group == 'metastasis' ~ 'Metastasis'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(group = factor(group, levels = c('CTC1', 'CTC single', 'CTC cluster', 'CTO', 'Metastasis', 'CTC2'))) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels))
+
+x %>% 
+ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.4, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = get_scater_palette('tableau20')) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+##### Selected categories
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, and CTO), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+```{r bc_group-bc-composition-prop-alluvial-selcat, fig.width = 3.2, fig.asp = 0.618}
+require(ggalluvial)
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+
+
+use_data_sum <- use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                ctc_single.cpm_total, 
+                ctc_cluster.cpm_total, 
+                cto.cpm_total) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(group = factor(group, levels = c('CTC1', 'CTC single', 'CTC cluster', 'CTO', 'CTC2'))) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels))
+
+x %>% 
+ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.5, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = get_scater_palette('tableau20')) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+##### Blood
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, and CTO), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+```{r bc_group-bc-composition-prop-alluvial-selcat-blood, fig.width = 3.2, fig.asp = 0.618}
+require(ggalluvial)
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+
+
+use_data_sum <- use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                `ctc_single-blood.cpm_total`, 
+                `ctc_cluster-blood.cpm_total`, 
+                `cto-blood.cpm_total`) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('-blood.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(group = factor(group, levels = c('CTC1', 'CTC single', 'CTC cluster', 'CTO', 'CTC2'))) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels))
+
+x %>% 
+ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.5, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = get_scater_palette('tableau20')) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+##### Ascites
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, and CTO), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+```{r bc_group-bc-composition-prop-alluvial-selcat-ascites, fig.width = 2.8, fig.asp = 0.618}
+require(ggalluvial)
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+
+
+use_data_sum <- use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                `ctc_single-ascites.cpm_total`, 
+                `ctc_cluster-ascites.cpm_total`, 
+                `cto-ascites.cpm_total`) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('-ascites.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(
+    group = factor(group, levels = c('CTC1', 'CTC single', 'CTC cluster', 'CTO', 'CTC2')),
+    group = droplevels(group)
+    ) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels)
+  )
+
+# Plot, we remove singles, because there are no single samples in ascites
+
+x %>% 
+  filter(group != 'CTC single') %>%
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.5, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = get_scater_palette('tableau20')) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+
+
+
+#### Barcode composition alluvial plot with PT
+
+Alluvial Flow of Barcode Frequencies Across Groups
+
+##### All Categories
+
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, CTO, and Metastasis), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+
+```{r bc_group-bc-composition-prop-alluvial-allcat-pt, fig.width = 3.2, fig.asp = 0.618}
+require(ggalluvial)
+
+use_data_chunk <- rbind(use_data, use_data_pt)
+
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+bc_levels <- c(bc_levels, 'Other')
+
+use_data_sum <- use_data_chunk %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+add_empty_ctc_other <- rbind(
+    c('CTC1', 'Other', 0),
+    c('CTC2', 'Other', 0)
+  ) %>% data.frame %>% 
+  set_names(colnames(use_data_sum)) %>% 
+  mutate(expr = as.numeric(expr))
+
+use_data_sum <- rbind(
+  use_data_sum,
+  add_empty_ctc_other
+)
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                ctc_single.cpm_total, 
+                ctc_cluster.cpm_total, 
+                cto.cpm_total, 
+                metastasis.cpm_total) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO',
+      group == 'metastasis' ~ 'Metastasis'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(group = factor(group, levels = c('PT', 'CTC1', 'CTC single', 'CTC cluster', 'CTO', 'Metastasis', 'CTC2'))) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels))
+
+use_palette <- get_scater_palette('tableau20')[seq_along(bc_levels)] %>% 
+  set_names(bc_levels)
+use_palette['Other'] <- 'grey70'
+x %>% 
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.35, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+  ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+x %>% 
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 1) +
+  geom_stratum(width = 0.35, size = 0) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+  ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+##### Selected categories
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, and CTO), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+```{r bc_group-bc-composition-prop-alluvial-selcat-pt, fig.width = 3.2, fig.asp = 0.618}
+require(ggalluvial)
+
+use_data_chunk <- rbind(use_data, use_data_pt)
+
+
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+bc_levels <- c(bc_levels, 'Other')
+
+
+use_data_sum <- use_data_chunk %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+add_empty_ctc_other <- rbind(
+    c('CTC1', 'Other', 0),
+    c('CTC2', 'Other', 0)
+  ) %>% data.frame %>% 
+  set_names(colnames(use_data_sum)) %>% 
+  mutate(expr = as.numeric(expr))
+
+use_data_sum <- rbind(
+  use_data_sum,
+  add_empty_ctc_other
+)
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                ctc_single.cpm_total, 
+                ctc_cluster.cpm_total, 
+                cto.cpm_total) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(group = factor(group, levels = c('PT', 'CTC1', 'CTC single', 'CTC cluster', 'CTO', 'CTC2'))) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels))
+
+use_palette <- get_scater_palette('tableau20')[seq_along(bc_levels)] %>% 
+  set_names(bc_levels)
+use_palette['Other'] <- 'grey70'
+
+x %>% 
+ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.35, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+x %>% 
+ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 1) +
+  geom_stratum(width = 0.35, size = 0) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+##### Blood
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, and CTO), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+```{r bc_group-bc-composition-prop-alluvial-selcat-blood-pt, fig.width = 3.2, fig.asp = 0.618}
+require(ggalluvial)
+
+use_data_chunk <- rbind(use_data, use_data_pt)
+
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+bc_levels <- c(bc_levels, 'Other')
+
+
+use_data_sum <- use_data_chunk %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+add_empty_ctc_other <- rbind(
+    c('CTC1', 'Other', 0),
+    c('CTC2', 'Other', 0)
+  ) %>% data.frame %>% 
+  set_names(colnames(use_data_sum)) %>% 
+  mutate(expr = as.numeric(expr))
+
+use_data_sum <- rbind(
+  use_data_sum,
+  add_empty_ctc_other
+)
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                `ctc_single-blood.cpm_total`, 
+                `ctc_cluster-blood.cpm_total`, 
+                `cto-blood.cpm_total`) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('-blood.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(group = factor(group, levels = c('PT', 'CTC1', 'CTC single', 'CTC cluster', 'CTO', 'CTC2'))) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels))
+
+use_palette <- get_scater_palette('tableau20')[seq_along(bc_levels)] %>% 
+  set_names(bc_levels)
+use_palette['Other'] <- 'grey70'
+
+x %>% 
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.35, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+  ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+x %>% 
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 1) +
+  geom_stratum(width = 0.35, size = 0) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+  ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+```
+
+
+##### Ascites
+
+For CTC1 and CTC2, the percentage of barcodes is calculated based on the total expression -sum- of the barcodes in each group. For the other groups (CTC single, CTC cluster, and CTO), the percentage of barcodes is calculated based on the total expression -sum of cpm- of the barcodes across all groups. This allows us to compare the composition of barcodes in CTC1 and CTC2 with the composition in the other groups, while accounting for differences in total barcode expression between the groups.
+```{r bc_group-bc-composition-prop-alluvial-selcat-ascites-pt, fig.width = 2.8, fig.asp = 0.618}
+require(ggalluvial)
+
+use_data_chunk <- rbind(use_data, use_data_pt)
+
+bc_levels <- use_data %>%
+  filter(!is.na(bc_group_cluster)) %>%
+  group_by(
+    bc, bc_group_cluster
+  ) %>%
+  summarise(expr = sum(expr)) %>%
+  pivot_wider(names_from = bc_group_cluster, values_from = expr) %>%
+  mutate(
+    fc = log2(CTC1/CTC2)
+  ) %>%
+  arrange(desc(CTC1)) %>%
+  pull(bc)
+bc_levels <- c(bc_levels, 'Other')
+
+
+use_data_sum <- use_data_chunk %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster, bc) %>%
+  summarise(expr = sum(expr)) %>% 
+  dplyr::rename(group = bc_group_cluster) %>% 
+  mutate(group = as.character(group))
+
+add_empty_ctc_other <- rbind(
+    c('CTC1', 'Other', 0),
+    c('CTC2', 'Other', 0)
+  ) %>% data.frame %>% 
+  set_names(colnames(use_data_sum)) %>% 
+  mutate(expr = as.numeric(expr))
+
+use_data_sum <- rbind(
+  use_data_sum,
+  add_empty_ctc_other
+)
+
+use_bc_freq <- bc_freq %>% 
+  dplyr::select(bc, 
+                `ctc_single-ascites.cpm_total`, 
+                `ctc_cluster-ascites.cpm_total`, 
+                `cto-ascites.cpm_total`) %>% 
+  filter(bc %in% use_data$bc) %>% 
+  pivot_longer(cols = -bc, names_to = 'group', values_to = 'expr') %>% 
+  mutate(
+    group = gsub('-ascites.cpm_total', '', group),
+    group = case_when(
+      group == 'ctc_single' ~ 'CTC single',
+      group == 'ctc_cluster' ~ 'CTC cluster',
+      group == 'cto' ~ 'CTO'
+    )
+  )
+
+
+x <- rbind(
+  use_data_sum,
+  use_bc_freq[,colnames(use_data_sum)]
+) %>% 
+  group_by(group) %>% 
+  mutate(prop = expr / sum(expr)) %>% 
+  ungroup %>% 
+  mutate(
+    group = factor(group, levels = c('PT', 'CTC1', 'CTC single', 'CTC cluster', 'CTO', 'CTC2')),
+    group = droplevels(group)
+    ) %>% 
+  mutate(
+    bc = factor(bc, levels = bc_levels)
+  )
+
+use_palette <- get_scater_palette('tableau20')[seq_along(bc_levels)] %>% 
+  set_names(bc_levels)
+use_palette['Other'] <- 'grey70'
+
+# Plot, we remove singles, because there are no single samples in ascites
+
+x %>% 
+  filter(group != 'CTC single') %>%
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 0.7) +
+  geom_stratum(width = 0.35, size = linewidth_default/2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+x %>% 
+  filter(group != 'CTC single') %>%
+  ggplot(aes(x = group, stratum = bc, alluvium = bc, y = prop, fill = bc)) +
+  geom_flow(stat = "alluvium", alpha = 1) +
+  geom_stratum(width = 0.35, size = 0) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(guide = guide_axis(angle = 45), expand = expansion(mult = c(0, 0))) +
+  # theme_minimal() +
+  scale_fill_manual(values = use_palette) +
+  labs(
+    x = '',
+    y = 'Percentage'
+    ) +
+  theme(
+    axis.line.y = element_blank()
+  )
+
+
+```
+
+
+
+
+#### Barcode composition scatter
+```{r bc_group-bc-composition-prop-scatter, fig.width=2.5, fig.asp = 0.618}
+n_group_spots <- use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    n_group_spots = n()
+  )
+
+bc_spots_group_freq <- use_data %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  mutate(is.expr = expr > 0) %>% 
+  group_by(bc, bc_group_cluster) %>%
+  summarise(
+    n_spots = sum(is.expr)
+  ) %>% 
+  left_join(n_group_spots) %>% 
+  mutate(n_spots_prop = n_spots / n_group_spots) %>% 
+  dplyr::select(-n_spots, -n_group_spots) %>% 
+  pivot_wider(names_from = bc_group_cluster, values_from = n_spots_prop) %>% 
+  mutate(
+    CTC1 = ifelse(is.na(CTC1), 0, CTC1),
+    CTC2 = ifelse(is.na(CTC2), 0, CTC2),
+    diff_ctc1_ctc2 = abs(CTC1 - CTC2),
+    log2_ctc1_ctc2 = log2(CTC1 / CTC2),
+    
+    bc_group_class = ifelse(diff_ctc1_ctc2 > 0.10 & log2_ctc1_ctc2 > 1, 'CTC1', 'Undetermined'),
+    bc_group_class = ifelse(diff_ctc1_ctc2 > 0.10 & log2_ctc1_ctc2 < -1, 'CTC2', bc_group_class)
+  ) %>% 
+  left_join(
+    bc_freq
+  )
+
+
+bc_spots_group_freq %>% 
+  ggplot(aes(CTC1, CTC2, label = bc, color = bc_group_class)) +
+  geom_point(size = 2, alpha = 0.5, pch  = 16) +
+  scale_color_manual(values = c(bc_group_cluster_palette, Undetermined = 'grey60')) +
+  geom_text_repel(size = geom_text_size*0.5) +
+  labs(
+    title = 'Proportion of spots expressing\neach barcode across groups',
+    x = 'Proportion of spots in CTC1',
+    y = 'Proportion of spots in CTC2',
+    color = ''
+  )
+
+# ctc_single.cpm_total
+# ctc_cluster.cpm_total
+# cto.cpm_total
+# metastasis.cpm_total
+bc_spots_group_freq %>% 
+  ggplot(aes(CTC1, CTC2, label = bc, size = log2(metastasis.cpm_total))) +
+  geom_point(alpha = 0.5, pch  = 16) +
+  scale_color_manual(values = c(bc_group_cluster_palette, Undetermined = 'grey60')) +
+  # geom_text_repel(size = geom_text_size*0.5) +
+  scale_x_continuous(expand = expansion(mult = c(0.15, 0.15))) +
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.15))) +
+  labs(
+    title = 'Proportion of spots expressing\neach barcode across groups',
+    x = 'Proportion of spots in CTC1',
+    y = 'Proportion of spots in CTC2',
+    color = ''
+  )
+
+```
+
+
+```{r bc_group-bc-composition-prop-scatter-2}
+x <- bc_spots_group_freq %>% 
+  # left_join(bc_freq, by = 'bc') %>% 
+  # filter(!is.na(bc_group_class)) %>% 
+  select(bc, bc_group_class,ctc_single.prop,  ctc_cluster.prop, cto.prop, metastasis.prop) %>% 
+  pivot_longer(cols = c(ctc_single.prop,  ctc_cluster.prop, cto.prop, metastasis.prop), names_to = 'group', values_to = 'prop') %>% 
+  mutate(
+    group = gsub('\\.prop', '', group),
+    bc_group_class = factor(bc_group_class, levels = c('Undetermined', 'CTC1', 'CTC2'))
+  )
+
+bc_order <- x %>% arrange(as.numeric(bc_group_class)) %>% pull(bc) %>% unique
+
+x %>% 
+  mutate(
+    bc = factor(bc, levels = bc_order)
+    ) %>%
+  ggplot(aes(bc, prop, fill = bc_group_class)) +
+  geom_col() +
+  facet_wrap(~group, scales = 'free_y') +
+  scale_fill_manual(values = c(bc_group_cluster_palette, Undetermined = 'grey60')) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(
+    x = '',
+    y = 'Proportion of samples',
+    fill = ''
+  ) +
+  theme_facet
+
+
+x <- bc_spots_group_freq %>% 
+  # left_join(bc_freq, by = 'bc') %>% 
+  select(bc, bc_group_class,ctc_single.cpm_total,  ctc_cluster.cpm_total, cto.cpm_total, metastasis.cpm_total) %>% 
+  pivot_longer(cols = c(ctc_single.cpm_total,  ctc_cluster.cpm_total, cto.cpm_total, metastasis.cpm_total), names_to = 'group', values_to = 'CPM') %>% 
+  mutate(
+    group = gsub('\\.cpm_total', '', group),
+    bc_group_class = factor(bc_group_class, levels = c('Undetermined', 'CTC1', 'CTC2'))
+  )
+
+bc_order <- x %>% arrange(as.numeric(bc_group_class)) %>% pull(bc) %>% unique
+
+x %>% 
+  mutate(
+    bc = factor(bc, levels = bc_order)
+    ) %>%
+  ggplot(aes(bc, log2(CPM+1), fill = bc_group_class)) +
+  geom_col() +
+  facet_wrap(~group, scales = 'free_y') +
+  scale_fill_manual(values = c(bc_group_cluster_palette, Undetermined = 'grey60')) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(
+    x = '',
+    y = 'log2(CPM + 1)',
+    fill = ''
+  ) +
+  theme_facet
+
+
+x <- bc_spots_group_freq %>% 
+  # left_join(bc_freq, by = 'bc') %>% 
+  select(bc, n_spots, bc_group_class,ctc_single.cpm_total,  ctc_cluster.cpm_total, cto.cpm_total, metastasis.cpm_total) %>% 
+  pivot_longer(cols = c(ctc_single.cpm_total,  ctc_cluster.cpm_total, cto.cpm_total, metastasis.cpm_total), names_to = 'group', values_to = 'CPM') %>% 
+  mutate(group = gsub("\\.cpm_total", "", group))
+x %>% 
+  ggplot(aes(n_spots, log2(CPM+1), color = bc_group_class, labels = bc)) +
+  geom_point(pch = 16, size = 1.5, alpha = 0.7) +
+  geom_text_repel(data = x %>% filter(bc_group_class!='Undetermined'), 
+                  size = geom_text_size*0.5,
+                  segment.size = linewidth_default/4) +
+  facet_wrap(~group, scales = 'free_y') +
+  scale_color_manual(values = c(bc_group_cluster_palette, Undetermined = 'grey60')) +
+  scale_x_continuous(
+    transform = scales::pseudo_log_trans(10),
+    breaks = c(0, 100, 1000, 10000)) +
+  theme_facet +
+  labs(
+    x = 'Number of spots in spatial data',
+    y = 'Sum of log2(CPM+1) celltracker',
+    color = ''
+  )
+  
+```
+
+
+
+
+
+
+
+
+
+## FindMarkers results
+
+The tables of results can be downloaded using the following links:
+
+```{r  write-dge-xlsx-comp}
+chunk_suffix <- 'comp'
+dge_list <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+file_xlsx <- file.path('./docs/file',
+                       rmd_file, 
+                       paste0('dge_', chunk_suffix, '.xlsx')
+                       )
+
+dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+
+# Generate workbook
+wb <- createWorkbook()
+for(i in names(dge_list)) {
+  addWorksheet(wb, i)
+  res <- dge_list[[i]]$result
+  writeData(wb, i, res)
+}
+saveWorkbook(wb, file_xlsx, TRUE)
+
+dge_file_xlsx <- file_xlsx
+```
+
+- [**FindMarkers for specific comparisons**](`r gsub("docs/", "" , dge_file_xlsx)`)
+
+```{r  write-dge-xlsx-bc_group_cluster}
+chunk_suffix <- 'bc_group_cluster'
+dge_list <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+file_xlsx <- file.path('./docs/file',
+                       rmd_file, 
+                       paste0('dge_', chunk_suffix, '.xlsx')
+                       )
+
+dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+
+# Generate workbook
+wb <- createWorkbook()
+for(i in names(dge_list)) {
+  addWorksheet(wb, i)
+  res <- dge_list[[i]]$result
+  writeData(wb, i, res)
+}
+saveWorkbook(wb, file_xlsx, TRUE)
+
+dge_file_xlsx <- file_xlsx
+```
+
+
+- [**FindMarkers for barcode groups**](`r gsub("docs/", "" , dge_file_xlsx)`)
+
+
+
+
+## GSEA for specific comparisons
+```{r gsea-conf-comparisons}
+chunk_suffix <- 'comp'
+gse_list <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+# dge_list <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+
+
+# Get gene set grouping 
+gsets_grouping_file <- './data/external/pdac3_gsea_gsets_groups_20260408.xlsx' 
+gsets_sheets <- readxl::excel_sheets(path = gsets_grouping_file)
+gsets_groups <- foreach(i = gsets_sheets) %do% {
+  readxl::read_xlsx(gsets_grouping_file, sheet = i)
+}
+names(gsets_groups) <- gsets_sheets
+```
+
+
+### Download results
+
+<!-- Write GSEA results to xlsx file -->
+```{r  write-gsea-xlsx-comparisons}
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseReactome = 'gseReactome'
+)
+    
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+for(sr in names(gse_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in gse_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('gsea_', chunk_suffix, '_', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      addWorksheet(wb, i)
+      if(gc != sr){
+        if(!is.null(gse_list[[i]][[sr]][[gc]])) {
+          res <- gse_list[[i]][[sr]][[gc]]@result
+          writeData(wb, i, res)
+        }
+      }
+      if(gc == sr){
+        if(!is.null(gse_list[[i]][[sr]])) {
+          res <- gse_list[[i]][[sr]]@result
+          writeData(wb, i, res)
+        }
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Write links to download GSEA results -->
+```{r write-ctc-gsea-xlsx-links-comparisons, echo = FALSE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'GSEA') {
+      cat(paste0("- [**Gene set enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'gseGO') {
+      cat(paste0("- [**Gene set enrichment analysis: GO:", gc, "**](", file_xlsx, ")"), '\n\n')
+    }   
+    if(sr == 'gseKEGG') {
+      cat(paste0("- [**Gene set enrichment analysis: KEGG**](", file_xlsx, ")"), '\n\n')
+    }  
+    if(sr == 'gseReactome') {
+      cat(paste0("- [**Gene set enrichment analysis: Reactome**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+
+### Dotplots
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-comparisons, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseReactome = 'gseReactome'
+)
+
+use_prefix <- 'gse-dotplot'
+use_linewidth <- 1/2.141959
+root_section_number <- 7.2
+section_n <- 1
+subsection_n <- 1
+
+i <- names(gse_list)[2]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in names(gse_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        
+        x %<>% 
+          mutate(log10P = -log10(p.adjust)) %>% 
+          arrange(p.adjust) %>% 
+          head(30)
+        
+        res <- gse.dotplot(
+          x,
+          x = 'NES',
+          color = 'NES',
+          size = "log10P",
+          # color2log10 = TRUE,
+          showCategory = 20,
+          label_format = 60
+        ) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.3, 2.5)) +
+          scale_color_gradient2(trans = "reverse") +
+          scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+          labs(
+            size = expression(paste("lo", g[10],"(Adjusted P value)")),
+            caption = 'Showing only top-30 gene sets\nNES = Normalized Enrichment Score'
+            # size = 'Gene set\nsize'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = use_linewidth/2),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = use_linewidth/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm")
+          )
+        
+        subchunkify(res, 
+                    fig.width = 3.5, 
+                    fig.height = (3.5*0.3) + nrow(x)*0.05,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+### Gene-set similarity matrix by gene set collection
+```{r gse-jcmatrix-comparisons-conf, echo=FALSE}
+
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseKEGG = 'gseKEGG',
+  # gseReactome = 'gseReactome'
+)
+
+#
+# Generate a list of JC similarity matrices by gene-set
+#
+library(enrichplot)
+p_thrs <- 0.05
+topn <- 50
+use_comp <- names(gse_list)[1]
+jc_matrix_list <- foreach(use_comp = names(gse_list)) %do% {
+  data_gse <- foreach(sr = names(gse_collections)) %do% {
+    data_by_collection <- foreach(gc = gse_collections[[sr]])  %do% {
+      
+      if(sr == 'GSEA') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr == 'gseGO') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs & simplify) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        use_enrich_results <- gse_list[[use_comp]][[sr]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      
+      if(length(top_descriptions) > 1) {
+        use_enrich_results <- pairwise_termsim(
+          use_enrich_results, 
+          showCategory = use_n_categories, 
+          method = "JC")
+        use_enrich_results@termsim[top_descriptions, top_descriptions]
+      } else {
+        NULL
+      }
+    }
+    names(data_by_collection) <- gse_collections[[sr]]
+    return(compact(data_by_collection))
+  }
+  names(data_gse) <- names(gse_collections)
+  return(data_gse)
+}
+names(jc_matrix_list) <- names(gse_list)
+```
+
+Gene-set similarity matrix by comparison and gene set collections. Heatmap showing the pair-wise similarity matrix of top `r topn` gene sets with an adjusted P value < `r p_thrs` in each gene group. Heatmap colors represent the Jaccard similarity coefficient.
+
+
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-jcmatrix-comparisons, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+library(NbClust)
+
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+  # gseGO = c("BP", "MF"),
+  # gseReactome = 'gseReactome'
+)
+
+use_prefix <- 'gse-jcmatrix-comparisons'
+use_linewidth <- 1/2.141959
+root_section_number <- 8.3
+section_n <- 1
+subsection_n <- 1
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+
+i <- names(jc_matrix_list)[1]
+for(i in names(jc_matrix_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  
+  section_n <- section_n + 1
+  
+  for(sr in names(jc_matrix_list[[i]])) {
+    
+    for(gc in names(jc_matrix_list[[i]][[sr]])) {
+      use_mat <- jc_matrix_list[[i]][[sr]][[gc]]
+      if(nrow(use_mat) >= 10) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        
+        # Define number of clusters
+        use_max.nc <- ifelse(nrow(use_mat) <= 15, 5, round(nrow(use_mat) * 0.3))
+        nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                               min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                               index = 'silhouette')
+        
+        
+        n_split <- nbclust_res$Best.nc['Number_clusters']
+        
+        # ha_top <- HeatmapAnnotation(
+        #   foo = anno_block(
+        #     # labels = c("Translation", "Cell division"),
+        #     labels = 1:n_split,
+        #     labels_gp = gpar(col = "black", fontsize = 8),
+        #     gp = gpar(lwd = 0, lty = 0))
+        # )
+        
+        ht <- Heatmap(
+          use_mat,
+          name = 'Jaccard index',
+          column_split = n_split,
+          row_split = n_split,
+          column_title = NULL,
+          row_title = NULL,
+          row_names_gp = gpar(fontsize = 4),
+          col = col_fun,
+          show_column_dend = FALSE,
+          show_column_names = FALSE,
+          border = TRUE,
+          # top_annotation = ha_top,
+          heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                                      labels_gp = gpar(fontsize = 8)
+          ),
+          width = unit(7, "cm"),
+          
+          clustering_method_rows = "ward.D",
+          clustering_method_columns = "ward.D"
+          # clustering_distance_rows = function(x) as.dist(1 - x),
+          # clustering_distance_columns = function(x) as.dist(1 - x)
+        )
+        
+        subchunkify(draw(ht), 
+                    fig.width = 7.2,
+                    fig.height = (7.2*0.3) + nrow(use_mat)*0.15,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+### Dotplots grouped (complete)
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-comparisons, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped'
+use_linewidth <- 1/2.141959
+root_section_number <- 8.4
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+         
+        x %<>% 
+          mutate(
+            is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+            log10P = -log10(p.adjust)
+          ) %>% 
+          arrange(p.adjust) %>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group))
+        
+        # Duplicated descriptions
+        dup_descriptions <- x$Description[x$Description %>% duplicated]
+        if(length(dup_descriptions) > 0) {
+          x %<>% 
+            mutate(
+              gset_db = gsub("_.*", "", ID),
+              Description = ifelse(
+                Description %in% dup_descriptions, 
+                paste0(Description," (", gset_db,")"), 
+                Description)
+            )
+        }
+        
+        group_levels <- x %>% 
+          group_by(Group) %>%
+          summarise(median_NES = median(NES)) %>% 
+          arrange(desc(median_NES)) %>% 
+          pull(Group)
+        
+        res <- x %>% 
+          mutate(
+            Group = factor(
+              default_labeller(20)(Group), 
+              levels = default_labeller(20)(group_levels)),
+            Description = fct_reorder(Description, NES)
+          ) %>%
+          ggplot(aes(x = NES, y = Description, fill = NES, size = log10P, stroke = linewidth_default/2)) +
+          geom_point(pch = 21, aes(color = is.sign)) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.8, 2)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_color_manual(values = c(no = 'white', yes = 'black')) +
+          scale_y_discrete(labels = default_labeller(80))+
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          facet_grid(rows = vars(Group), scales = 'free_y', space = 'free_y') +
+          labs(
+            y = '',
+            size = expression(paste("lo", g[10],"(Adjusted P value)")),
+            color = 'FDR < 0.05',
+            caption = paste0('Showing only top-', nrow(x),' gene sets\nNES = Normalized Enrichment Score')
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_text(angle = 0, hjust = 0, size = 4),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm"),
+            
+            panel.spacing=unit(0.1, "lines")
+          )
+          
+       n_gsets <- x$ID %>% unique() %>% length()
+       # use_width <-  7.2 + n_gsets * 0.02
+       use_width <- 4.2
+       # use_asp <-  0.318 + n_gsets * 0.017
+       # use_asp <-  n_gsets * 0.05
+       use_asp <-  n_gsets * 0.021
+       use_height <- use_width * use_asp
+        
+       subchunkify(res,
+                   fig.width = use_width,
+                   fig.height = use_height,
+                   dpi = 600,
+                   prefix = use_prefix,
+                   suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+### Dotplots grouped (unnamed)
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-comparisons-unnamed, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped-unnamed'
+root_section_number <- 8.5
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+
+        x %<>% 
+          mutate(
+            is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+            log10P = -log10(p.adjust)
+          ) %>% 
+          arrange(p.adjust) %>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group)) %>% 
+          group_by(Description) %>% 
+          # For entries with duplicated Description, keep only one based on min P-value
+          # slice_min(pvalue, n =1 , with_ties = FALSE) %>% 
+          ungroup()
+                
+        # Duplicated descriptions
+        dup_descriptions <- x$Description[x$Description %>% duplicated]
+        if(length(dup_descriptions) > 0) {
+          x %<>% 
+            mutate(
+              gset_db = gsub("_.*", "", ID),
+              Description = ifelse(
+                Description %in% dup_descriptions, 
+                paste0(Description," (", gset_db,")"), 
+                Description)
+            )
+        }
+        
+        group_levels <- x %>% 
+          group_by(Group) %>%
+          summarise(median_NES = median(NES)) %>% 
+          arrange(desc(median_NES)) %>% 
+          pull(Group)
+        
+        res <- x %>% 
+          mutate(
+            Group = factor(
+              default_labeller(20)(Group), 
+              levels = default_labeller(20)(group_levels)),
+            Description = fct_reorder(Description, NES)
+          ) %>%
+          ggplot(aes(x = NES, y = Description, fill = NES, size = log10P)) +
+          geom_point(pch = 21, aes(color = is.sign), stroke = linewidth_default/2) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.5, 1.1)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_color_manual(values = c(no = 'white', yes = 'black')) +
+          scale_y_discrete(labels = default_labeller(80))+
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          facet_grid(rows = vars(Group), scales = 'free_y', space = 'free_y') +
+          labs(
+            x = '',
+            y = '',
+            size = expression(paste("lo", g[10],"(FDR)")),
+            color = 'FDR\n< 0.05'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_blank(),
+            strip.text.x = element_blank(),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+            axis.text.y = element_blank(),
+            axis.text.x = element_blank(),
+            
+            legend.text = element_text(size = 3), 
+            legend.title = element_text(size = 3),
+            legend.key.width = unit(0.1, "cm"),
+            legend.key.height = unit(0.1, "cm"),
+            
+            panel.spacing=unit(0.1, "lines"),
+            plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches")
+          )
+        
+        n_gsets <- x$ID %>% unique() %>% length()
+        n_gsgroups <- 1
+        
+        
+        
+        # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+        # nmodels <- x$model %>% unique() %>% length()
+        nmodels <- 2
+        
+        # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+        # use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        
+        # Calculate height: top margin + tickmarks + bottom margin and legend
+        use_height <- 0.0217 + 0.0217 + n_gsets * 0.0492 + (0.035*(nmodels - 1)) + 0.4984
+        subchunkify(res +
+                      guides(
+                        size  = guide_legend(direction = "vertical",
+                                             keyheight = unit(0.0289, "inches"),
+                                             keywidth = unit(0.0289, "inches")
+                        ),
+                        color = "none",
+                        fill  = "none"
+                        # color = guide_legend(direction = "vertical"),
+                        # fill  = guide_colourbar(direction = "vertical")
+                      ) +
+                      theme(
+                        legend.position = "bottom",
+                        legend.box = "horizontal"
+                      ),
+                    fig.width = use_width,
+                    fig.height = use_height,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+        
+        # Print legend
+        res_legend <- get_legend(
+          res +
+            guides(
+              color = guide_legend(direction = "vertical"),
+              size  = guide_legend(direction = "vertical"),
+              fill  = guide_colourbar(direction = "vertical")
+            ) +
+            theme(
+              legend.position = "bottom",
+              legend.box = "horizontal"
+            )
+        )
+        subchunkify(plot_grid(res_legend),
+                    fig.width = 1.8,
+                    fig.height = 1,
+                    dpi = 600,
+                    prefix = paste0(use_prefix,'-legend-unnamed'),
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+### Dotplots simplified (complete)
+
+Here we show a single point for each group. 
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-simplified, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped-simplified'
+root_section_number <- 8.6
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+         
+        
+        x %<>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group))
+        
+        x_median <- x %>% 
+          group_by(Group) %>% 
+          summarise(
+            group_n = n(),
+            group_nes = median(NES)
+          ) %>% 
+          mutate(
+            group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+          ) %>% 
+          arrange(group_nes)
+        
+        x_simplified <- x %>% 
+          left_join(x_median) %>% 
+          filter(.sign == group_sign) %>% 
+          group_by(Group) %>%
+          slice_min(p.adjust, n = 1, with_ties = FALSE) %>% 
+          mutate(
+            log10P = -log10(p.adjust)
+          )
+        
+        
+        
+        res <- x_simplified %>% 
+          mutate(
+            Group = factor(
+              Group, 
+              levels = x_median$Group)
+          ) %>%
+          ggplot(aes(x = NES, y = Group, fill = NES, size = log10P)) +
+          geom_point(pch = 21, color = 'black') +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.8, 2)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_y_discrete(labels = default_labeller(80))+
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          labs(
+            y = '',
+            size = expression(paste("lo", g[10],"(Adjusted P value)"))
+            # caption = 'NES = Normalized Enrichment Score'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_text(angle = 0, hjust = 0, size = 4),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm"),
+            
+            panel.spacing=unit(0.1, "lines")
+          )
+        
+       #    
+       n_gsets <- x_simplified$Group %>% unique() %>% length()
+       # use_width <-  7.2 + n_gsets * 0.02
+       use_width <- 2.8
+       # use_asp <-  0.318 + n_gsets * 0.017
+       # use_asp <-  n_gsets * 0.05
+       use_asp <-  n_gsets * 0.051
+       use_height <- use_width * use_asp
+
+       subchunkify(res,
+                   fig.width = use_width,
+                   fig.height = use_height,
+                   dpi = 600,
+                   prefix = use_prefix,
+                   suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+
+### Dotplots simplified (unnamed)
+
+Here we show a single point for each group. 
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot-grouped-simplified-unnamed, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+use_prefix <- 'gse-dotplot-grouped-simplified-unnamed'
+root_section_number <- 8.7
+section_n <- 1
+subsection_n <- 1
+
+use_comps <- intersect(names(gse_list), names(gsets_groups))
+i <- use_comps[1]
+sr <- names(gse_collections)[1]
+gc <- gse_collections[[sr]][1]
+
+for(i in use_comps) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+         
+        
+        x %<>% 
+          left_join(gsets_groups[[i]]) %>% 
+          filter(!is.na(Group))
+        
+        x_median <- x %>% 
+          group_by(Group) %>% 
+          summarise(
+            group_n = n(),
+            group_nes = median(NES)
+          ) %>% 
+          mutate(
+            group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+          ) %>% 
+          arrange(group_nes)
+        
+        x_simplified <- x %>% 
+          left_join(x_median) %>% 
+          filter(.sign == group_sign) %>% 
+          group_by(Group) %>%
+          slice_min(p.adjust, n = 1, with_ties = FALSE) %>% 
+          mutate(
+            log10P = -log10(p.adjust)
+          )
+        
+        
+        
+        res <- x_simplified %>% 
+          mutate(
+            Group = factor(
+              Group, 
+              levels = x_median$Group)
+          ) %>%
+          ggplot(aes(x = NES, y = Group, fill = NES, size = log10P)) +
+          geom_point(pch = 21, color = 'black') +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.8, 2)) +
+          scale_fill_gradient2(trans = "reverse") +
+          scale_x_continuous(expand = expansion(mult = c(0.20, 0.20))) +
+          labs(
+            x = '',
+            y = '',
+            size = expression(paste("lo", g[10],"(Adjusted P value)"))
+            # caption = 'NES = Normalized Enrichment Score'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = linewidth_default),
+            strip.text.y = element_blank(),
+            strip.text.x = element_blank(),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+            axis.text.y = element_blank(),
+            axis.text.x = element_blank(),
+            
+            legend.text = element_text(size = 3), 
+            legend.title = element_text(size = 3),
+            legend.key.width = unit(0.1, "cm"),
+            legend.key.height = unit(0.1, "cm"),
+            
+            plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches")
+          )
+        
+        
+        n_gsets <- x$Group %>% unique() %>% length()
+        
+        # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+        # nmodels <- x$model %>% unique() %>% length()
+        nmodels <- 2
+        
+        # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+        # use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+        
+        # Calculate height: top margin + tickmarks + bottom margin and legend
+        use_height <- 0.0217 + 0.0217 + (n_gsets*1.75) * 0.0492 + (0.035*(nmodels - 1)) + 0.4984
+        subchunkify(res +
+                      guides(
+                        size  = guide_legend(direction = "vertical",
+                                             keyheight = unit(0.0289, "inches"),
+                                             keywidth = unit(0.0289, "inches")
+                        ),
+                        color = "none",
+                        fill  = "none"
+                        # color = guide_legend(direction = "vertical"),
+                        # fill  = guide_colourbar(direction = "vertical")
+                      ) +
+                      theme(
+                        legend.position = "bottom",
+                        legend.box = "horizontal"
+                      ),
+                    fig.width = use_width,
+                    fig.height = use_height,
+                    dpi = 600,
+                    prefix = use_prefix,
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+        
+        # Print legend
+        res_legend <- get_legend(
+          res +
+            guides(
+              color = guide_legend(direction = "vertical"),
+              size  = guide_legend(direction = "vertical"),
+              fill  = guide_colourbar(direction = "vertical")
+            ) +
+            theme(
+              legend.position = "bottom",
+              legend.box = "horizontal"
+            )
+        )
+        subchunkify(plot_grid(res_legend),
+                    fig.width = 1.8,
+                    fig.height = 1,
+                    dpi = 600,
+                    prefix = paste0(use_prefix,'-legend-unnamed'),
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+
+knitr::opts_knit$set(
+  base.dir = NULL
+  )
+cat("\n\n")
+```
+
+
+
+## Erythroid signature
+
+Here we calcualte a score for the red blood cell content based on the percentage of hemoglobin genes in the total counts.
+```{r rbc-pct-conf}
+min_pct_hb <- 1
+# Extract % of Hb genes. We do it in the merged data, combining human and mouse
+i <- seu_full_list[[1]]
+hb_percent <- foreach(i = seu_full_list, .combine = rbind) %do%{
+  # use_feat <- grep("^GRCm39-Hb[^(p)]|^GRCh38-HB[^(P)]", rownames(i), value = TRUE)
+  i$percent.hb <- Seurat::PercentageFeatureSet(i, pattern = "^GRCm39-Alas|^GRCh38-Alas|^GRCm39-Hb[^(p)]|^GRCh38-HB[^(P)]")
+  i[[]] %>% 
+    select(percent.hb) %>%
+    rownames_to_column('sample_barcode')
+}
+
+# Categorise Hb content
+hb_percent %<>% 
+  mutate(hb = ifelse(percent.hb >= min_pct_hb, "Hb+", "Hb-")) 
+
+# Add to seurat objects
+seu[[]] %<>% 
+  rownames_to_column('sample_barcode') %>% 
+  left_join(hb_percent, by = 'sample_barcode') %>% 
+  column_to_rownames('sample_barcode')
+
+seu_bc[[]] %<>% 
+  rownames_to_column('sample_barcode') %>% 
+  left_join(hb_percent, by = 'sample_barcode') %>% 
+  column_to_rownames('sample_barcode')
+
+```
+
+
+### Score distribution by groups
+```{r rbc-pct-wilcox, fig.width = 2, fig.asp = 0.8}
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster))
+
+# table
+wilcox_res <- use_data%>%
+  wilcox_test(data =., percent.hb ~ bc_group_cluster) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance("p.adj")
+
+
+summary_stats <- use_data %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    median_hb_percent = median(percent.hb, na.rm = TRUE)
+  ) %>% 
+  ungroup %>% 
+  pivot_wider(names_from = bc_group_cluster, values_from = median_hb_percent) %>% 
+  dplyr::rename(median_CTC1 = CTC1, median_CTC2 = CTC2, median_ST = ST)
+
+
+wilcox_res %<>% 
+  left_join(summary_stats %>% mutate(.y. = "percent.hb"))
+
+wilcox_res %>% 
+  kbl(caption = "Wilcox test results for hallmark scores by barcode group cluster") %>%
+  kable_styling(full_width = FALSE)
+
+
+use_comparisons <- combn(levels(use_data$bc_group_cluster), 2, simplify = FALSE)
+
+
+use_data %>% 
+  ggplot(aes(bc_group_cluster, percent.hb, fill = bc_group_cluster)) +
+  geom_violin(scale = 1, alpha = 0.7, linewidth = linewidth_default/2) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+  # 
+  # geom_violin(quantile.colour = 'black', 
+  #             quantile.linetype = 'solid',
+  #             # quantile.linewwidth = linewidth_default,
+  #             quantiles = c(0.5)) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  stat_compare_means(
+    comparisons = use_comparisons,
+    method = 'wilcox.test',
+    label = "p.format",
+    size = geom_text_size
+  ) +
+  # scale_y_log10()
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.1)),
+    transform = scales::transform_pseudo_log(base = 10, sigma = 0.001),
+    breaks = c(0, 0.01, 1, 10, 100),
+    labels = paste0(c(0, 0.01, 1, 10, 100), '%')
+    ) +
+  labs(
+    y = 'Percentage of\nhemoglobin genes expression',
+    x = '',
+    fill = ''
+  ) +
+  # scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  theme(
+    strip.text = element_text(size = 7)
+  )
+
+```
+
+

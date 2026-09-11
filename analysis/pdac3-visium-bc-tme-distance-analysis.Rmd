@@ -1,0 +1,1612 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "TME distance to barcodes groups"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+  ctc_met_bc_se_file: ./data/barcodes/pdac3-ctc-mets/se.rds
+  min_counts: 5
+  min_present_prop: 0.25
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2023.1.Hs
+  max_dist: 1000
+  crop_dist: 1000
+  ncores: 4
+---
+
+
+
+## Configuration
+
+Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(DT)
+library(knitr)
+library(patchwork)
+library(kableExtra)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(UpSetR)
+library(GGally)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(arsenal)
+#
+library(Seurat)
+library(SummarizedExperiment)
+library(semla)
+library(edgeR)
+library(scran)
+library(ComplexHeatmap)
+library(circlize)
+library(mgcv)
+library(gratia)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+# source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.h = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/h.all.', params$msigdb_vs, '.symbols.gmt'),
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data processing (copied from analysis/pdac3-visium-bc-reanalysis.Rmd)
+
+### Load initial data
+
+Load CTC barcodes SummarizedExperiment
+```{r dw-load-ctc-bc-se}
+ctc_met_bc_se <- readRDS(params$ctc_met_bc_se_file)
+ctc_met_bc_se <- ctc_met_bc_se[,ctc_met_bc_se$total_bc>0]
+assay(ctc_met_bc_se, 'cpm') <- edgeR::cpm(assay(ctc_met_bc_se, 'norm_counts'))
+assay(ctc_met_bc_se, 'logcpm') <- edgeR::cpm(assay(ctc_met_bc_se, 'norm_counts'), log = TRUE)
+
+colData(ctc_met_bc_se) <- colData(ctc_met_bc_se) %>% data.frame %>% 
+  mutate(
+    sample_type_grouped = ifelse(grepl('^ctc_cluster', sample_type), 'ctc_cluster', sample_type),
+    sample_type_grouped = ifelse(sample_type == 'ctc_single_pool', 'ctc_single', sample_type_grouped),
+    sample_type_grouped = ifelse(sample_type %in% c('liver', 'lung'), 'metastasis', sample_type_grouped),
+    use_anatomical_origin = ifelse(anatomical_origin == 'cardiac_puncture', 'blood', anatomical_origin),
+    sample_type_origin = paste(sample_type_grouped, use_anatomical_origin, sep = '-'),
+    sample_type_origin = gsub('-lung|-liver', '', sample_type_origin)
+  ) %>% 
+  DataFrame
+
+```
+
+Load human seurat data
+```{r dw-load-seurat}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+
+# Change rownames
+rownames(seu@assays[['Spatial']]) <-  gsub('GRCh38-', '',rownames(seu@assays[['Spatial']]))
+
+i <- 'SCT'
+rownames(seu@assays[[i]]@counts) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@counts))
+rownames(seu@assays[[i]]@data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@data))
+rownames(seu@assays[[i]]@scale.data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@scale.data))
+seu@assays[[i]]@var.features <- gsub('GRCh38-', '', seu@assays[[i]]@var.features)
+```
+
+List of individual seurat files with full features
+```{r dw-list-seurat}
+seurat_files <- list.files(file.path(params$seurat_dir, "seurat"), pattern = "S[0-9]+.*.rds", full.names = TRUE)
+```
+
+
+### Load processed data
+```{r dw-load-processed-data}
+bc_spot_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_spot_freq.rds'))
+bc_mat <- readRDS(file.path(params$seurat_dir, "seurat_bc", "bc_matrix.rds"))
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+seu_full_list <- readRDS(file.path(params$seurat_dir, "seurat", 'seurat_merged_list.rds'))
+seu_bc <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+
+# Load hotspot data
+hotspot_bc <- readRDS(file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+caf_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_caf_hotspot_2.rds"))
+caf_hotspot_r_dist <- readRDS(file.path(params$output_dir, "hotspots_tme", "caf_hotspot_r_dist.rds"))
+lyve1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_lyve1_hotspot_1.rds"))
+lyve1_hotspot_r_dist <- readRDS(file.path(params$output_dir, "hotspots_tme", 'lyve1_hotspot_r_dist.rds'))
+pecam1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_pecam1_hotspot_1.rds")) 
+pecam1_hotspot_r_dist <- readRDS(file.path(params$output_dir, "hotspots_tme", 'pecam1_hotspot_r_dist.rds'))
+```
+
+
+Add annotation to Seurat object
+```{r dw-add-annotation-seurat}
+# Add hotspots distances
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(caf_hotspot_r_dist, by = 'barcode') %>%
+  left_join(lyve1_hotspot_r_dist, by = 'barcode') %>%
+  left_join(pecam1_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+
+# Add CAF spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- caf_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$caf_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add Lyve1 spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- lyve1_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$lyve1_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add Pecam1 spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- pecam1_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$pecam1_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add hotspots defined based on barcodes. We use the same criteria as in chunk::dw-bc-hotspots-to-seurat
+st_spots <- hotspot_bc$st_specific %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+ctc_spots <- hotspot_bc$ctc_top %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+
+seu[[]] %<>% 
+  rownames_to_column('sample_spot') %>%
+  mutate(
+    bc_group = ifelse(sample_spot %in% st_spots, 'ST', ifelse(sample_spot %in% ctc_spots, 'CTC', 'other'))
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+```
+
+Create a Seurat object combining CAF hotspots and BC group annotation. We will use this Seurat object for the spatial distribution analysis.
+```{r dw-seurat-bc-caf}
+# Seurat object combining CAF and BC group annotation
+seu_bc_caf <- seu
+
+# Add bc_group_cluster information
+bc_group_cluster_spots <- seu_bc[[]] %>% rownames_to_column('sample_spot') %>% 
+  select(sample_spot, bc_group_cluster, clusters)
+
+# Add Acta2 expression
+# Rename groups
+seu_bc_caf[[]] %<>% 
+  rownames_to_column('sample_spot') %>% 
+  left_join(bc_group_cluster_spots) %>% 
+  mutate(
+    group_hotspots = paste(bc_group, caf_hotspots, sep = '_'),
+    group_hotspots = gsub("_NA", "", group_hotspots),
+    group_hotspots = gsub("NA_", "", group_hotspots),
+    group_hotspots = gsub("yes", "CAF", group_hotspots),
+    group_hotspots = gsub("other_CAF", "CAF", group_hotspots),
+    
+    group_hotspots_extended = paste(bc_group_cluster, caf_hotspots, sep = '_'),
+    group_hotspots_extended = gsub("_NA", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("NA_", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("yes", "CAF", group_hotspots_extended),
+    group_hotspots_extended = ifelse(group_hotspots_extended == 'NA', 'other', group_hotspots_extended)
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+# Remove spots with no annotation
+seu_bc_caf <- seu_bc_caf[,seu_bc_caf$group_hotspots !='other']
+```
+
+
+
+
+
+## Acta2 proximity
+
+Load Acta2 expression
+```{r pcam1-proximity}
+acta2_exprs <- readRDS(file.path(params$output_dir, 'caf/acta2_expression.rds'))
+```
+
+Showing radial distance from CTC groups and ST spots to nearest Acta2 hotspots
+```{r bc_group_clusters-acta2-proximity-conf}
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster))  %>%
+  rownames_to_column('barcode') %>%
+  left_join(acta2_exprs) %>% 
+  mutate(acta2_exprs = acta2 >= 2)
+```
+
+
+### Summary statistics
+```{r bc_group_clusters-acta2-proximity-table}
+use_data %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    median_dist_2d = median(r_dist_caf_hotspot_2d, na.rm = TRUE)%>% round(2),
+    median_dist_3d = median(r_dist_caf_hotspot_3d_transformed, na.rm = TRUE)%>% round(2),
+    mean_dist_2d = mean(r_dist_caf_hotspot_2d, na.rm = TRUE)%>% round(2),
+    sd_dist_2d = sd(r_dist_caf_hotspot_2d, na.rm = TRUE)%>% round(2),
+    mean_dist_3d = mean(r_dist_caf_hotspot_3d_transformed, na.rm = TRUE)%>% round(2),
+    sd_dist_3d = sd(r_dist_caf_hotspot_3d_transformed, na.rm = TRUE) %>% round(2),
+    acta2_exprs_prop = round(sum(acta2_exprs, na.rm = TRUE) / n(), 2),
+  ) %>% 
+  kbl(caption = 'Summary statistics for CAF distance') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+
+### Co-localization
+
+#### Barplot
+Percentage of spots with Acta2 expression (UMI counts >= 1) in each subgroup
+```{r bc_group_clusters-acta2-colocalization, fig.width = 0.984, fig.asp = 1}
+use_data %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    acta2_exprs_prop = round(sum(acta2_exprs, na.rm = TRUE) / n(), 2)
+  ) %>%
+  ggplot(aes(bc_group_cluster, acta2_exprs_prop, fill = bc_group_cluster)) +
+  geom_col()+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     labels = scales::percent) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  labs(
+    x = '',
+      y = 'Spots %',
+    fill = ''
+  ) +
+  guides(fill = 'none') +
+  theme_facet  +
+  theme(
+    # plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank()
+  )
+```
+
+#### Expression distribution
+```{r bc_group_clusters-acta2-coloc-score, fig.width= 1.2, fig.asp = 0.738}
+
+median_stats <- use_data %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    median_expression = median(acta2, na.rm = TRUE),
+    iqr_expression = iqr(acta2, na.rm = TRUE),
+    spots_n = sum(acta2 >= 1, na.rm = TRUE),
+    spots_prop = sum(acta2 >= 1, na.rm = TRUE) / n(),
+  )
+
+stats_table <- use_data %>% 
+  wilcox_test(acta2 ~ bc_group_cluster) %>% 
+  left_join(median_stats, by = c('group1' = 'bc_group_cluster'))
+
+median_stats %>% 
+  kbl(caption = 'Summary statistics for Acta2 expression') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+stats_table %>% 
+  kbl(caption = 'Summary statistics for Acta2 expression') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+### Distance: Volin plot
+```{r bc_group_clusters-acta2-proximity-violin, fig.width= 1.2, fig.asp = 0.738}
+dist_var <- 'r_dist_caf_hotspot_3d_transformed'
+use_data_plot <- use_data %>% 
+  mutate(
+    r_dist = ifelse(.[[dist_var]] < 0, 0, .[[dist_var]])
+    )
+
+# Calculate automatic upper limit to crop values (not applied at the moment)
+upper_limit_box <- use_data %>%  
+  mutate(
+    r_dist = ifelse(.[[dist_var]] < 0, 0, .[[dist_var]])
+    ) %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    q3 = quantile(r_dist, .75),
+    iqr = iqr(r_dist)
+    # upper_limit = 1.5*IQR + q3
+  ) %>% 
+  mutate(
+    upper_limit_whisker = 1.5*iqr + q3,
+    upper_limit_cropped = 0.75*iqr + q3
+  )
+cropped_val <- upper_limit_box$upper_limit_cropped %>% max()
+
+
+# Define a fixed value to crop distance values
+cropped_val <- 3
+y_axis_breaks <- scales::breaks_extended(n = 5)(c(0, cropped_val))
+y_axis_labels <- as.character(y_axis_breaks)
+y_axis_labels[length(y_axis_labels)] <- paste0('≥', y_axis_labels[length(y_axis_labels)])
+
+# Comapre means to add p-values to the plot. We will use Wilcoxon test, which is a non-parametric test that does not assume normal distribution of the data. We use manual calculation instea of adding stat_compare_means to the plot because we are using cropped vales for plotting
+stat.test <- compare_means(
+  r_dist ~ bc_group_cluster, 
+  data = use_data_plot,
+  method = "wilcox.test"
+) %>% 
+  mutate(
+    y.position = cropped_val + cropped_val*0.1
+  )
+
+use_data_plot %>%
+  mutate(
+    r_dist = r_dist / 1000,
+    r_dist = ifelse(r_dist >= cropped_val, cropped_val, r_dist)
+  ) %>%
+  ggplot(aes(bc_group_cluster, r_dist,fill = bc_group_cluster)) +
+  geom_violin(scale = 1, rel_min_height = 0.01, alpha = 0.7, linewidth = linewidth_default/2) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25)),
+                       breaks = y_axis_breaks,
+                       labels = y_axis_labels
+    ) +
+  stat_pvalue_manual(
+    stat.test, 
+    size = geom_text_size * 0.8,
+    label = "p.signif", 
+    tip.length = 0.01, 
+    step.increase = 0.2,
+    vjust = 0.5,
+    bracket.size = linewidth_default/2
+  ) +
+    labs(
+      title = '',
+      x = '',
+      y = 'Distance (mm)'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+```
+
+
+## Lyve1 proximity
+
+Load Lyve1 expression
+```{r lyve1-proximity}
+lyve1_exprs <- readRDS(file.path(params$output_dir, 'hotspots_tme/lyve1_expression.rds'))
+```
+
+Showing radial distance from CTC groups and ST spots to nearest Lyve1 hotspots
+```{r bc_group_clusters-lyve1-proximity-conf}
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster))  %>%
+  rownames_to_column('barcode') %>%
+  left_join(lyve1_exprs) %>% 
+  mutate(lyve1_exprs = lyve1 >= 1)
+```
+
+
+### Summary statistics
+```{r bc_group_clusters-lyve1-proximity-table}
+use_data %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    median_dist_2d = median(r_dist_lyve1_hotspot_2d, na.rm = TRUE)%>% round(2),
+    median_dist_3d = median(r_dist_lyve1_hotspot_3d_transformed, na.rm = TRUE)%>% round(2),
+    mean_dist_2d = mean(r_dist_lyve1_hotspot_2d, na.rm = TRUE)%>% round(2),
+    sd_dist_2d = sd(r_dist_lyve1_hotspot_2d, na.rm = TRUE)%>% round(2),
+    mean_dist_3d = mean(r_dist_lyve1_hotspot_3d_transformed, na.rm = TRUE)%>% round(2),
+    sd_dist_3d = sd(r_dist_lyve1_hotspot_3d_transformed, na.rm = TRUE) %>% round(2)
+  ) %>% 
+  kbl(caption = 'Summary statistics for Lyve1 distance') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+
+### Co-localization
+
+#### Barplot
+Percentage of spots with Lyve1 expression (UMI counts >= 1) in each subgroup
+```{r bc_group_clusters-lyve1-colocalization, fig.width = 0.984, fig.asp = 1}
+use_data %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    lyve1_exprs_prop = round(sum(lyve1_exprs, na.rm = TRUE) / n(), 2)
+  ) %>%
+  ggplot(aes(bc_group_cluster, lyve1_exprs_prop, fill = bc_group_cluster)) +
+  geom_col()+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     labels = scales::percent) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  labs(
+    x = '',
+      y = 'Spots %',
+    fill = ''
+  ) +
+  guides(fill = 'none') +
+  theme_facet  +
+  theme(
+    # plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank()
+  )
+```
+
+#### Expression distribution
+```{r bc_group_clusters-lyve1-coloc-score, fig.width= 1.2, fig.asp = 0.738}
+
+median_stats <- use_data %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    median_expression = median(lyve1, na.rm = TRUE),
+    iqr_expression = iqr(lyve1, na.rm = TRUE),
+    spots_n = sum(lyve1 >= 1, na.rm = TRUE),
+    spots_prop = sum(lyve1 >= 1, na.rm = TRUE) / n(),
+  )
+
+stats_table <- use_data %>% 
+  wilcox_test(lyve1 ~ bc_group_cluster) %>% 
+  left_join(median_stats, by = c('group1' = 'bc_group_cluster'))
+
+median_stats %>% 
+  kbl(caption = 'Summary statistics for Lyve1 expression') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+stats_table %>% 
+  kbl(caption = 'Summary statistics for Lyve1 expression') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+### Distance: Volin plot
+```{r bc_group_clusters-lyve1-proximity-violin, fig.width= 1.2, fig.asp = 0.738}
+dist_var <- 'r_dist_lyve1_hotspot_3d_transformed'
+use_data_plot <- use_data %>% 
+  mutate(
+    r_dist = ifelse(.[[dist_var]] < 0, 0, .[[dist_var]])
+    )
+
+# Calculate automatic upper limit to crop values (not applied at the moment)
+upper_limit_box <- use_data %>%  
+  mutate(
+    r_dist = ifelse(.[[dist_var]] < 0, 0, .[[dist_var]])
+    ) %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    q3 = quantile(r_dist, .75),
+    iqr = iqr(r_dist)
+    # upper_limit = 1.5*IQR + q3
+  ) %>% 
+  mutate(
+    upper_limit_whisker = 1.5*iqr + q3,
+    upper_limit_cropped = 0.75*iqr + q3
+  )
+cropped_val <- upper_limit_box$upper_limit_cropped %>% max()
+
+
+# Define a fixed value to crop distance values
+cropped_val <- 3
+y_axis_breaks <- scales::breaks_extended(n = 5)(c(0, cropped_val))
+y_axis_labels <- as.character(y_axis_breaks)
+y_axis_labels[length(y_axis_labels)] <- paste0('≥', y_axis_labels[length(y_axis_labels)])
+
+# Comapre means to add p-values to the plot. We will use Wilcoxon test, which is a non-parametric test that does not assume normal distribution of the data. We use manual calculation instea of adding stat_compare_means to the plot because we are using cropped vales for plotting
+stat.test <- compare_means(
+  r_dist ~ bc_group_cluster, 
+  data = use_data_plot,
+  method = "wilcox.test"
+) %>% 
+  mutate(
+    y.position = cropped_val + cropped_val*0.1
+  )
+
+use_data_plot %>%
+  mutate(
+    r_dist = r_dist / 1000,
+    r_dist = ifelse(r_dist >= cropped_val, cropped_val, r_dist)
+  ) %>%
+  ggplot(aes(bc_group_cluster, r_dist,fill = bc_group_cluster)) +
+  geom_violin(scale = 1, rel_min_height = 0.01, alpha = 0.7, linewidth = linewidth_default/2) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25)),
+                       breaks = y_axis_breaks,
+                       labels = y_axis_labels
+    ) +
+  stat_pvalue_manual(
+    stat.test, 
+    size = geom_text_size * 0.8,
+    label = "p.signif", 
+    tip.length = 0.01, 
+    step.increase = 0.2,
+    vjust = 0.5,
+    bracket.size = linewidth_default/2
+  ) +
+    labs(
+      title = '',
+      x = '',
+      y = 'Distance (mm)'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+```
+
+
+## Pecam1 proximity
+
+Load Pecam1 expression
+```{r pecam1-proximity}
+pecam1_exprs <- readRDS(file.path(params$output_dir, 'hotspots_tme/pecam1_expression.rds'))
+```
+
+Showing radial distance from CTC groups and ST spots to nearest Pecam1 hotspots
+```{r bc_group_clusters-pecam1-proximity-conf}
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster))  %>%
+  rownames_to_column('barcode') %>%
+  left_join(pecam1_exprs) %>% 
+  mutate(pecam1_exprs = pecam1 >= 1)
+```
+
+
+### Summary statistics
+```{r bc_group_clusters-pecam1-proximity-table}
+use_data %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    median_dist_2d = median(r_dist_pecam1_hotspot_2d, na.rm = TRUE)%>% round(2),
+    median_dist_3d = median(r_dist_pecam1_hotspot_3d_transformed, na.rm = TRUE)%>% round(2),
+    mean_dist_2d = mean(r_dist_pecam1_hotspot_2d, na.rm = TRUE)%>% round(2),
+    sd_dist_2d = sd(r_dist_pecam1_hotspot_2d, na.rm = TRUE)%>% round(2),
+    mean_dist_3d = mean(r_dist_pecam1_hotspot_3d_transformed, na.rm = TRUE)%>% round(2),
+    sd_dist_3d = sd(r_dist_pecam1_hotspot_3d_transformed, na.rm = TRUE) %>% round(2)
+  ) %>% 
+  kbl(caption = 'Summary statistics for Pecam1 distance') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+
+### Co-localization
+
+#### Barplot
+Percentage of spots with Pecam1 expression (UMI counts >= 1) in each subgroup
+```{r bc_group_clusters-pecam1-colocalization, fig.width = 0.984, fig.asp = 1}
+use_data %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    pecam1_exprs_prop = round(sum(pecam1_exprs, na.rm = TRUE) / n(), 2)
+  ) %>%
+  ggplot(aes(bc_group_cluster, pecam1_exprs_prop, fill = bc_group_cluster)) +
+  geom_col()+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     labels = scales::percent) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  labs(
+    x = '',
+      y = 'Spots %',
+    fill = ''
+  ) +
+  guides(fill = 'none') +
+  theme_facet  +
+  theme(
+    # plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank()
+  )
+```
+
+#### Expression distribution
+```{r bc_group_clusters-pecam1-coloc-score, fig.width= 1.2, fig.asp = 0.738}
+
+median_stats <- use_data %>% 
+  group_by(bc_group_cluster) %>%
+  summarise(
+    median_expression = median(pecam1, na.rm = TRUE),
+    iqr_expression = iqr(pecam1, na.rm = TRUE),
+    spots_n = sum(pecam1 >= 1, na.rm = TRUE),
+    spots_prop = sum(pecam1 >= 1, na.rm = TRUE) / n(),
+  )
+
+stats_table <- use_data %>% 
+  wilcox_test(pecam1 ~ bc_group_cluster) %>% 
+  left_join(median_stats, by = c('group1' = 'bc_group_cluster'))
+
+median_stats %>% 
+  kbl(caption = 'Summary statistics for Pecam1 expression') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+stats_table %>% 
+  kbl(caption = 'Summary statistics for Pecam1 expression') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+### Distance: Volin plot
+```{r bc_group_clusters-pecam1-proximity-violin, fig.width= 1.2, fig.asp = 0.738}
+dist_var <- 'r_dist_pecam1_hotspot_3d_transformed'
+use_data_plot <- use_data %>% 
+  mutate(
+    r_dist = ifelse(.[[dist_var]] < 0, 0, .[[dist_var]])
+    )
+
+# Calculate automatic upper limit to crop values (not applied at the moment)
+upper_limit_box <- use_data %>%  
+  mutate(
+    r_dist = ifelse(.[[dist_var]] < 0, 0, .[[dist_var]])
+    ) %>% 
+  group_by(bc_group_cluster) %>% 
+  summarise(
+    q3 = quantile(r_dist, .75),
+    iqr = iqr(r_dist)
+    # upper_limit = 1.5*IQR + q3
+  ) %>% 
+  mutate(
+    upper_limit_whisker = 1.5*iqr + q3,
+    upper_limit_cropped = 0.75*iqr + q3
+  )
+cropped_val <- upper_limit_box$upper_limit_cropped %>% max()
+
+
+# Define a fixed value to crop distance values
+cropped_val <- 3
+y_axis_breaks <- scales::breaks_extended(n = 5)(c(0, cropped_val))
+y_axis_labels <- as.character(y_axis_breaks)
+y_axis_labels[length(y_axis_labels)] <- paste0('≥', y_axis_labels[length(y_axis_labels)])
+
+# Comapre means to add p-values to the plot. We will use Wilcoxon test, which is a non-parametric test that does not assume normal distribution of the data. We use manual calculation instea of adding stat_compare_means to the plot because we are using cropped vales for plotting
+stat.test <- compare_means(
+  r_dist ~ bc_group_cluster, 
+  data = use_data_plot,
+  method = "wilcox.test"
+) %>% 
+  mutate(
+    y.position = cropped_val + cropped_val*0.1
+  )
+
+use_data_plot %>%
+  mutate(
+    r_dist = r_dist / 1000,
+    r_dist = ifelse(r_dist >= cropped_val, cropped_val, r_dist)
+  ) %>%
+  ggplot(aes(bc_group_cluster, r_dist,fill = bc_group_cluster)) +
+  geom_violin(scale = 1, rel_min_height = 0.01, alpha = 0.7, linewidth = linewidth_default/2) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+  scale_fill_manual(values = bc_group_cluster_palette) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25)),
+                       breaks = y_axis_breaks,
+                       labels = y_axis_labels
+    ) +
+  stat_pvalue_manual(
+    stat.test, 
+    size = geom_text_size * 0.8,
+    label = "p.signif", 
+    tip.length = 0.01, 
+    step.increase = 0.2,
+    vjust = 0.5,
+    bracket.size = linewidth_default/2
+  ) +
+    labs(
+      title = '',
+      x = '',
+      y = 'Distance (mm)'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+```
+
+
+## Macropahge and Monocyte weight from RCTD
+```{r deconv-proximity-conf}
+rctd_dist <- readRDS(file.path(params$output_dir, 'seurat_mm', 'rctd_multi_df_tabmuris_r_dist.rds'))
+rctd_multi_df <- readRDS(file.path(params$output_dir, 'seurat_mm', 'rctd_multi_df_tabmuris_filtered.rds'))
+bc_group_dist <- readRDS(file.path(params$output_dir, 'seurat_hs', 'bc_group_cluster_r_dist.rds'))
+```
+
+### Score distribution
+```{r myeloid-colocalization-conf}
+use_weight_df <- rctd_multi_df %>% 
+  filter(confidence) %>%
+  select(barcode, cell_type_grouped, weight) %>% 
+  group_by(barcode, cell_type_grouped) %>%
+  summarise(weight = max(weight)) %>% 
+  filter(cell_type_grouped %in% c('macrophage', 'monocyte')) %>% 
+  pivot_wider(names_from = cell_type_grouped, values_from = weight)
+
+use_data <- seu_bc[[]] %>% 
+  rownames_to_column('barcode') %>% 
+  left_join(use_weight_df , by = 'barcode') %>% 
+  mutate(
+    macrophage = ifelse(is.na(macrophage), FALSE, macrophage),
+    monocyte = ifelse(is.na(monocyte), FALSE, monocyte)
+  ) %>% 
+  filter(!is.na(bc_group_cluster))
+```
+
+#### Table
+```{r myeloid-colocalization-table}
+use_score_vars <- c('monocyte', 'macrophage')
+
+use_formula <- as.formula(paste('bc_group_cluster ~', paste0("`", use_score_vars, "`", collapse = ' + ')))
+tab1 <- tableby(use_formula, data=use_data,
+                control = tableby.control(test = TRUE, total = FALSE))
+summary(tab1, pfootnote=TRUE, title='Distribution of Monocyte and Macrophage deconvolution weights in BC group spots')
+
+```
+
+#### Macrophage score
+```{r macrophage-colocalization-dist, fig.width = 0.984, fig.asp = 1}
+use_comparisons <- combn(levels(seu_bc$bc_group_cluster), 2, simplify = FALSE)
+use_data %>% 
+    ggplot(aes(bc_group_cluster, macrophage, fill = bc_group_cluster)) +
+    geom_violin(scale = 'width', alpha = 0.7, 
+                linewidth = linewidth_default/2, 
+                trim = FALSE,
+                adjust = 2
+    ) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+    scale_fill_manual(values = bc_group_cluster_palette) +
+  stat_compare_means(
+    comparisons = use_comparisons,
+    bracket.size = linewidth_default/2,
+    size = geom_text_size * 0.8
+    )+
+    labs(
+      title = '',
+      x = '',
+      y = 'Macrophage score'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(0, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+  
+```
+
+#### Monocyte score
+```{r monocyte-colocalization-dist, fig.width = 0.984, fig.asp = 1}
+use_comparisons <- combn(levels(seu_bc$bc_group_cluster), 2, simplify = FALSE)
+use_data %>% 
+    ggplot(aes(bc_group_cluster, monocyte, fill = bc_group_cluster)) +
+    geom_violin(scale = 'width', alpha = 0.7, 
+                linewidth = linewidth_default/2, 
+                trim = FALSE,
+                adjust = 2
+    ) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+    scale_fill_manual(values = bc_group_cluster_palette) +
+  stat_compare_means(
+    comparisons = use_comparisons,
+    bracket.size = linewidth_default/2,
+    size = geom_text_size * 0.8
+    )+
+    labs(
+      title = '',
+      x = '',
+      y = 'Monocyte score'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(0, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+  
+```
+
+
+
+## CAF subtypes proximity
+```{r caf_sub-proximity-conf}
+caf_mk <- readRDS(file.path(params$output_dir, "caf", 'caf_subtypes_markers.rds'))
+fb_subtypes_data <- readRDS(file.path(params$output_dir, "caf", 'ucell_fibroblast_subtypes.rds'))
+fb_subtypes_dist <- readRDS(file.path(params$output_dir, 'caf/caf_subtypes_r_dist.rds'))
+bc_group_dist <- readRDS(file.path(params$output_dir, 'seurat_hs', 'bc_group_cluster_r_dist.rds'))
+```
+
+Showing radial distance from CTC and ST spots to nearest cell type hotspots
+
+```{r bc_group_clusters-caf_sub-proximity-conf}
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  rownames_to_column('barcode') %>%
+  left_join(fb_subtypes_dist, by = 'barcode')
+rdist_vars_2d <- grep('r_dist_cafst_2d' , colnames(use_data), value = TRUE)
+rdist_vars_3d <- grep('r_dist_cafst_3d' , colnames(use_data), value = TRUE)
+```
+
+### Co-localization
+
+We define co-localization as spots at a radial distance ≤ 0 microns from a cell type hotspot. This means that the spot is either within the hotspot or exactly at the boundary of the hotspot.
+
+```{r bc_group_clusters-caf_sub-proximity-coloc-table}
+use_data_co <- use_data %>% 
+  dplyr::select(barcode, bc_group_cluster, all_of(rdist_vars_2d)) %>% 
+  mutate(across(all_of(rdist_vars_2d), ~ .x  <= 0))
+
+use_labels <- gsub('r_dist_cafst_2d_', '', rdist_vars_2d) %>% 
+  set_names(rdist_vars_2d)
+labels(use_data_co)  <- gsub('r_dist_cafst_2d_', '', rdist_vars_2d) %>% 
+  set_names(rdist_vars_2d)
+
+use_formula <- as.formula(paste('bc_group_cluster ~', paste0("`", rdist_vars_2d, "`", collapse = ' + ')))
+tab1 <- tableby(use_formula, data=use_data_co,
+                control = tableby.control(test = TRUE, total = FALSE))
+summary(tab1, pfootnote=TRUE, title='Co-localization of cell types')
+
+
+tab1 <- tableby(use_formula, data=use_data_co, cat.simplify = "label",
+                control = tableby.control(test = TRUE, total = FALSE, cat.stats = c("countpct")))
+summary(tab1, pfootnote=TRUE, title='Co-localization of cell types (simplified)')
+
+```
+
+
+
+#### Signature scores
+
+```{r bc_group_clusters-caf_sub-proximity-coloc-score, fig.width= 1.2, fig.asp = 0.738}
+var_ucell <- paste0(names(caf_mk$mm), '_mm_ucell') %>% grep('^FB', ., value = TRUE, invert = TRUE)
+
+use_data_plot <- use_data %>% 
+  left_join(fb_subtypes_data %>% select(barcode, all_of(var_ucell)), by = 'barcode') %>%
+  dplyr::select(barcode, bc_group_cluster, all_of(var_ucell)) %>% 
+  pivot_longer(cols = all_of(var_ucell), names_to = 'cell_type', values_to = 'score') %>% 
+  mutate(cell_type = gsub('_mm_ucell', '', cell_type))
+
+use_comparisons <- combn(levels(use_data_plot$bc_group_cluster), 2, simplify = FALSE)
+
+
+median_stats <- use_data_plot %>% 
+  group_by(cell_type, bc_group_cluster) %>%
+  summarise(
+    median_score = median(score),
+    iqr_score = iqr(score)
+  )
+
+stats_table <- use_data_plot %>% 
+  group_by(cell_type) %>% 
+  wilcox_test(score ~ bc_group_cluster) %>% 
+  left_join(median_stats, by = c('cell_type', 'group1' = 'bc_group_cluster')) %>% 
+  dplyr::rename(
+    group1_median_score = median_score,
+    group1_iqr_score = iqr_score
+  ) %>% 
+  left_join(median_stats, by = c('cell_type', 'group2' = 'bc_group_cluster')) %>% 
+  dplyr::rename(
+    group2_median_score = median_score,
+    group2_iqr_score = iqr_score
+  ) %>% 
+  mutate(
+    median_diff = group1_median_score - group2_median_score
+  )
+
+stats_table %>% 
+  kbl(caption = 'Summary statistics for CAF distance') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+  
+ct <- 'myCAF'
+for(ct in unique(use_data_plot$cell_type)) {
+  
+  cat("#####", ct, "\n\n")
+  res <- use_data_plot %>% 
+    filter(cell_type == ct) %>% 
+    mutate(
+      score = ifelse(score >= 0.5, 0.5, score)
+    ) %>%
+    ggplot(aes(bc_group_cluster, score, fill = bc_group_cluster)) +
+    geom_violin(scale = 'width', alpha = 0.7, 
+                linewidth = linewidth_default/2, 
+                trim = FALSE,
+                adjust = 2
+    ) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+    scale_fill_manual(values = bc_group_cluster_palette) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+    stat_compare_means(comparisons = use_comparisons, 
+                       size = geom_text_size * 0.8,
+                       label = "p.signif",
+                       bracket.size = linewidth_default/2,
+                       step.increase = 0.3,
+                       vjust = 0.5) +
+    # facet_wrap(~cell_type, scales = 'free_y') +
+    labs(
+      x = '',
+      y = 'Score',
+      title = ''
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+      ) #+
+    # theme_facet
+  
+  print(res)
+  cat("\n\n")
+}
+
+```
+
+
+### Score - Distances curves
+
+#### Individual plot
+```{r bc_group_clusters-caf_sub-score-distance-individual, fig.width= 1.2, fig.asp = 0.738}
+use_score_vars <- paste0(caf_mk$mm %>% names, '_mm_ucell') %>% grep('^FB', ., value = TRUE, invert = TRUE)
+
+use_data <- fb_subtypes_data %>% 
+  left_join(bc_group_dist) %>% 
+  pivot_longer(cols = starts_with('r_dist_'), 
+               names_to = 'bc_group_cluster', 
+               values_to = 'r_dist') %>% 
+  mutate(
+    bc_group_cluster = gsub('r_dist_', '', bc_group_cluster),
+    bc_group_cluster = factor(bc_group_cluster, levels = c('ST', 'CTC1', 'CTC2'))
+  ) %>% 
+  dplyr::select(barcode, bc_group_cluster, r_dist, all_of(use_score_vars)) %>% 
+  pivot_longer(cols = all_of(use_score_vars), names_to = 'cell_type', values_to = 'score') %>%
+  mutate(cell_type = gsub('_mm_ucell', '', cell_type))
+
+
+ct <- 'myCAF'
+for(ct in unique(use_data$cell_type)) {
+  
+  cat("#####", ct, "\n\n")
+  res <- use_data %>% 
+    filter(cell_type == ct) %>% 
+    filter(r_dist < params$max_dist) %>% 
+    mutate(
+      r_dist = ifelse(r_dist < 0, 0, r_dist)
+    ) %>%
+    ggplot(aes(r_dist/1000, score, color = bc_group_cluster)) +
+    geom_smooth(method = "gam", 
+                formula = y ~ s(x, bs = "cs"),
+                se = FALSE,
+                linewidth = linewidth_default*2) +
+    scale_color_manual(values = bc_group_cluster_palette) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0.15)),
+      limits = c(0, params$crop_dist/1000)
+    ) +
+    labs(
+      title = '',
+      x = 'Distance (mm)',
+      y = 'Score',
+      color = ''
+    )  +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, 0, 0.01), "inches")
+      ) 
+  
+  print(res)
+  cat("\n\n")
+}
+
+```
+
+
+#### Statistical test
+
+Use Generalized Additive Models (GAMs) to evaluate relationship between expression and distance across the groups. We used Cubic Regression Splines with shrinkage to allow for automated smoothing parameter selection and to penalize non-significant wiggles toward a zero-effect null space. All models were fitted using Restricted Maximum Likelihood (REML).
+
+```{r bc_group_clusters-caf_sub-score-distance-test}
+use_data <- fb_subtypes_data %>% 
+  left_join(bc_group_dist) %>% 
+  pivot_longer(cols = starts_with('r_dist_'), 
+               names_to = 'bc_group_cluster', 
+               values_to = 'r_dist') %>% 
+  mutate(
+    bc_group_cluster = gsub('r_dist_', '', bc_group_cluster),
+    bc_group_cluster = factor(bc_group_cluster, levels = c('ST', 'CTC1', 'CTC2'))
+  ) %>% 
+  dplyr::select(barcode, bc_group_cluster, r_dist, all_of(use_score_vars)) %>% 
+  pivot_longer(cols = all_of(use_score_vars), names_to = 'cell_type', values_to = 'score') %>%
+  mutate(cell_type = gsub('_mm_ucell', '', cell_type)) %>% 
+  filter(r_dist < params$max_dist) %>% 
+  mutate(r_dist = ifelse(r_dist < 0, 0, r_dist), 
+         r_dist = r_dist / 1000) 
+
+
+# Global assessment, comparing null and full model
+global_test_combined <- foreach(ct = unique(use_data$cell_type), .combine = rbind) %do% {
+  use_data_test <- use_data %>% 
+    filter(cell_type == ct)
+
+  m_null <- gam(score ~ s(r_dist, bs = "cs"), data = use_data_test, method = "REML")
+  m_full <- gam(score ~ bc_group_cluster + s(r_dist, by = bc_group_cluster, bs = "cs"), 
+                data = use_data_test, method = "REML")
+  global_test <- anova(m_null, m_full, test = "F") %>% 
+    tidy
+  global_test[2,] %>% 
+    mutate(term = ct)
+  
+}
+cat("Global Comparison: The overall effect of Condition was assessed by comparing a full model (allowing condition-specific smooths) against a null model (a single smooth for all data) using an Analysis of Deviance (F-test):\n\n")
+global_test_combined %>% 
+  mutate(
+    p.value = format.pval(p.value, 2)
+    ) %>% 
+  kbl(caption = 'Global test for differences in expression-distance curves') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+
+# Specific differences
+data_ordered <- use_data
+# We convert Condition to an "ordered" factor. 
+# This tells mgcv to treat the first level as a reference and others as differences.
+data_ordered$bc_group_cluster <- as.ordered(data_ordered$bc_group_cluster)
+contrasts(data_ordered$bc_group_cluster) <- "contr.treatment" # Use treatment contrasts
+gam_specific_combined <- foreach(ct = unique(data_ordered$cell_type)) %do% {
+  use_data_test <- data_ordered %>% 
+    filter(cell_type == ct)
+  gam(score ~ bc_group_cluster + s(r_dist, bs = "cs") + 
+        s(r_dist, by = bc_group_cluster, bs = "cs"), 
+      data = use_data_test, method = "REML")
+}
+names(gam_specific_combined) <- unique(data_ordered$cell_type)
+
+# Extract the parametric table (Intercepts and Magnitude differences)
+cat("Pairwise Comparison: Parametric coefficients. This table shows the differences in magnitude (the average vertical position of your curves). \n\n")
+parametric_table <- foreach(i = names(gam_specific_combined), .combine = rbind) %do% {
+  gam_specific_combined[[i]] %>% 
+    tidy(parametric = TRUE) %>% 
+    mutate(
+      term = c('Intercept', levels(data_ordered$bc_group_cluster)[-1]),
+      p.value = format.pval(p.value, 2)
+    ) %>%
+    filter(term != 'Intercept') %>%
+    mutate(cell_type = i)
+}
+
+parametric_table %>% 
+  dplyr::select(cell_type, everything())  %>% 
+  kbl(caption = 'Parametric (magnitude) differences by group, using as reference ST') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+
+# Extract the Smooth table (Shape/Slope differences)
+cat("Pairwise Comparison: Smooth terms. This table shows the differences in shape of the relationship between expression and distance. \n\n")
+smooth_table <- foreach(i = names(gam_specific_combined), .combine = rbind) %do% {
+  gam_specific_combined[[i]] %>% 
+    tidy(parametric = FALSE) %>% 
+    mutate(
+      term = c('Intercept', levels(data_ordered$bc_group_cluster)[-1]),
+      p.value = format.pval(p.value, 2)
+    ) %>%
+    filter(term != 'Intercept') %>%
+    mutate(cell_type = i)
+}
+smooth_table %>% 
+  dplyr::select(cell_type, everything()) %>%
+  kbl(caption = 'Smooth (shape) differences by group, using as reference ST') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+
+
+
+
+
+
+
+## Macrophage subtypes
+
+Analysis of gene-signature scores for macrophage subtypes derived from Khaliq (2024).
+```{r mc-conf}
+khaliq_signatures <- readRDS(file.path('./output/rnaseq-spatial/pdac3/seurat_mm', 'ucell_khaliq2024.rds')) %>% 
+  dplyr::rename(barcode = sample_barcode)
+
+mc_signatures <- khaliq_signatures %>% 
+  dplyr::select(barcode, `M1 signature_UCell`, `Tumor-associated Macrophages_UCell`) %>% 
+  dplyr::rename(M1_UCell = `M1 signature_UCell`, TAM_UCell = `Tumor-associated Macrophages_UCell`) %>% 
+  mutate(
+    m1_score_khaliq = log2((M1_UCell + 0.01)/ (TAM_UCell + 0.01)),
+    tam_score_khaliq = log2((TAM_UCell + 0.01)/ ( M1_UCell+ 0.01)),
+    m_subtype_khaliq = case_when(
+      m1_score_khaliq >= 3 ~ 'M1',
+      m1_score_khaliq <= -3 ~ 'TAM',
+      TRUE ~ 'Intermediate/Mixed'
+    ) 
+  ) 
+    
+seu_bc[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(mc_signatures) %>% 
+  column_to_rownames('barcode')
+
+
+bc_group_dist <- readRDS(file.path(params$output_dir, 'seurat_hs', 'bc_group_cluster_r_dist.rds'))
+```
+
+### Score distribution
+
+Score distribution in spots with different BC groups
+
+#### Table
+
+```{r mc-colocalization--table}
+
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster)) %>% 
+  dplyr::rename(
+    `M1 score` = M1_UCell,
+    `TAM score` = TAM_UCell,
+    `TAM/M1 score` = tam_score_khaliq
+  )
+  
+use_score_vars <- c('M1 score', 'TAM score', 'TAM/M1 score')
+
+use_formula <- as.formula(paste('bc_group_cluster ~', paste0("`", use_score_vars, "`", collapse = ' + ')))
+tab1 <- tableby(use_formula, data=use_data,
+                control = tableby.control(test = TRUE, total = FALSE))
+summary(tab1, pfootnote=TRUE, title='Distribution of MC scores in BC group spots')
+
+```
+
+
+#### M1 score
+```{r mc-colocalization-m1, fig.width = 0.984, fig.asp = 1}
+use_comparisons <- combn(levels(seu_bc$bc_group_cluster), 2, simplify = FALSE)
+seu_bc[[]] %>%
+  filter(!is.na(bc_group_cluster)) %>% 
+    ggplot(aes(bc_group_cluster, M1_UCell, fill = bc_group_cluster)) +
+    geom_violin(scale = 'width', alpha = 0.7, 
+                linewidth = linewidth_default/2, 
+                trim = FALSE,
+                adjust = 2
+    ) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+    scale_fill_manual(values = bc_group_cluster_palette) +
+  stat_compare_means(
+    comparisons = use_comparisons,
+    bracket.size = linewidth_default/2,
+    size = geom_text_size * 0.8
+    )+
+    labs(
+      title = '',
+      x = '',
+      y = 'M1 score'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(0, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+  
+```
+
+
+
+#### TAM score
+```{r mc-colocalization-tam, fig.width = 0.984, fig.asp = 1}
+use_comparisons <- combn(levels(seu_bc$bc_group_cluster), 2, simplify = FALSE)
+seu_bc[[]] %>%
+  filter(!is.na(bc_group_cluster)) %>% 
+    ggplot(aes(bc_group_cluster, TAM_UCell, fill = bc_group_cluster)) +
+    geom_violin(scale = 'width', alpha = 0.7, 
+                linewidth = linewidth_default/2, 
+                trim = FALSE,
+                adjust = 2
+    ) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+    scale_fill_manual(values = bc_group_cluster_palette) +
+    # scale_y_continuous(expand = expansion(mult = c(0, 0.25)),
+    #                    breaks = y_axis_breaks,
+    #                    labels = y_axis_labels
+    # ) +
+  stat_compare_means(
+    comparisons = use_comparisons,
+    bracket.size = linewidth_default/2,
+    size = geom_text_size * 0.8
+    )+
+    labs(
+      title = '',
+      x = '',
+      y = 'TAM score'#,
+      # caption = paste0('Distance cropped at ',cropped_val)
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(0, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+  
+```
+
+
+
+
+
+## ECM
+
+Load ECM UCell results
+```{r ecm-ucell}
+ecm_ucell <- readRDS(file.path(params$output_dir, 'seurat_mm/ucell_ecm.rds'))
+ucell_vars <- setdiff(names(ecm_ucell), 'sample_barcode')
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(bc_group_cluster))  %>%
+  rownames_to_column('barcode') %>%
+  left_join(ecm_ucell, by = c('barcode' = 'sample_barcode'))
+
+```
+
+
+### Summary statistics
+```{r bc_group_clusters-ecm-table}
+use_formula <- as.formula(paste0("bc_group_cluster ~ ", paste(ucell_vars, collapse = '+')))
+tab1 <- tableby(use_formula, 
+                data= use_data, 
+                total = FALSE,
+                control= tableby.control(
+                  numeric.stats=c("mean", "sd", "median", "q1q3")
+                )
+)
+summary(tab1)
+```
+
+### Ucell scores distribution
+```{r bc_group_clusters-ecm-score-dist, fig.width= 1.2, fig.asp = 0.738}
+ct <- ucell_vars[1]
+for(ct in ucell_vars) {
+  cat("####", ct, "\n\n")
+  
+  stat.test <- compare_means(
+    as.formula(paste0(ct,  "~ bc_group_cluster")), 
+    data = use_data,
+    method = "wilcox.test"
+  ) %>% 
+    mutate(
+      y.position = 1 + 1*0.2
+    )
+
+  
+  res_plot <- use_data %>% 
+    ggplot(aes(bc_group_cluster, .data[[ct]], fill = bc_group_cluster)) +
+    geom_violin(scale = 'width', alpha = 0.7, 
+                linewidth = linewidth_default/2, 
+                trim = FALSE,
+                adjust = 2
+    ) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, linewidth = linewidth_default/2) +
+    scale_fill_manual(values = bc_group_cluster_palette) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.25)), breaks = c(0, 0.5, 1)) +
+    stat_pvalue_manual(
+      stat.test, 
+      label = "p.signif", 
+      tip.length = 0.01, 
+      step.increase = 0.15, 
+      size = geom_text_size * 0.8,
+      bracket.size = linewidth_default/2
+    ) +
+    labs(
+      x = '',
+      y = 'Score',
+      title = ''
+    ) +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, -0.05, 0.01), "inches"),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    )
+  print(res_plot)
+  cat("\n\n")
+}
+```
+
+
+### Distances curves (max `r params$max_dist`` microns)
+
+```{r bc_group_clusters-ecm-expression-distance-max_dist, fig.width= 1.2, fig.asp = 0.738}
+ct <- ucell_vars[1]
+for(ct in ucell_vars) {
+  cat("####", ct, "\n\n")
+  
+  res_plot <-  use_data %>% 
+    mutate(r_dist = r_dist_caf_hotspot_3d_transformed) %>% 
+    filter(r_dist < params$max_dist) %>%
+    mutate(
+      r_dist = ifelse(r_dist < 0, 0, r_dist)
+    ) %>%
+    ggplot(aes(r_dist/1000, .data[[ct]], color = bc_group_cluster)) +
+    geom_smooth(method = "gam", 
+                formula = y ~ s(x, bs = "cs"),
+                se = FALSE,
+                linewidth = linewidth_default*2) +
+    scale_color_manual(values = bc_group_cluster_palette) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0.15))
+    ) +
+    labs(
+      title = '',
+      x = 'Distance (mm)',
+      y = 'Score',
+      color = ''
+    )  +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, 0, 0.01), "inches")
+    )
+  print(res_plot)
+  cat("\n\n")
+
+}
+
+
+```
+
+#### Statistical test
+
+Use Generalized Additive Models (GAMs) to evaluate relationship between expression and distance across the groups. We used Cubic Regression Splines with shrinkage to allow for automated smoothing parameter selection and to penalize non-significant wiggles toward a zero-effect null space. All models were fitted using Restricted Maximum Likelihood (REML).
+```{r bc_group_clusters-ecm-expression-distanc-max_dist-test}
+require(mgcv)   # For fitting GAMs
+require(gratia) # For plotting and difference smooths
+
+for(ct in ucell_vars) {
+  cat("####", ct, "\n\n")
+  use_data_test <- use_data %>% 
+    mutate(r_dist = r_dist_caf_hotspot_3d_transformed) %>% 
+    filter(r_dist < params$max_dist) %>% 
+    mutate(r_dist = r_dist / 1000,
+           r_dist = ifelse(r_dist < 0, 0, r_dist)) %>% 
+    mutate(Expression = .data[[ct]])
+  
+  # Global assessment, comparing null and full model
+  m_null <- gam(Expression ~ s(r_dist, bs = "cs"), data = use_data_test, method = "REML")
+  m_full <- gam(Expression ~ bc_group_cluster + s(r_dist, by = bc_group_cluster, bs = "cs"), 
+                data = use_data_test, method = "REML")
+  global_test <- anova(m_null, m_full, test = "F")
+  
+  cat("Global Comparison: The overall effect of Condition was assessed by comparing a full model (allowing condition-specific smooths) against a null model (a single smooth for all data) using an Analysis of Deviance (F-test):\n\n")
+  global_test %>% 
+    broom::tidy() %>% 
+    mutate(
+      term = c('Null model', 'Full model'),
+      p.value = format.pval(p.value, 2)
+    ) %>% 
+    kbl(caption = 'Global test for differences in expression-distance curves') %>%
+    kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>% 
+    print()
+  
+  # Specific differences
+  # We convert Condition to an "ordered" factor. 
+  # This tells mgcv to treat the first level as a reference and others as differences.
+  data_ordered <- use_data_test
+  data_ordered$bc_group_cluster <- as.ordered(data_ordered$bc_group_cluster)
+  contrasts(data_ordered$bc_group_cluster) <- "contr.treatment" # Use treatment contrasts
+  
+  m_diff <- gam(Expression ~ bc_group_cluster + s(r_dist, bs = "cs") + 
+                  s(r_dist, by = bc_group_cluster, bs = "cs"), 
+                data = data_ordered, method = "REML")
+  
+  # Extract the parametric table (Intercepts and Magnitude differences)
+  cat("Pairwise Comparison: Parametric coefficients. This table shows the differences in magnitude (the average vertical position of your curves). \n\n")
+  
+  parametric_table <- tidy(m_diff, parametric = TRUE)
+  parametric_table %>% 
+    mutate(
+      term = c('Intercept', levels(data_ordered$bc_group_cluster)[-1]),
+      p.value = format.pval(p.value, 2)
+    ) %>%
+    kbl(caption = 'Parametric (magnitude) differences by group.') %>%
+    kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>% 
+    print()
+  
+  # Extract the Smooth table (Shape/Slope differences)
+  cat("Pairwise Comparison: Smooth terms. This table shows the differences in shape of the relationship between expression and distance. \n\n")
+  smooth_table <- tidy(m_diff, parametric = FALSE)
+  smooth_table %>% 
+    mutate(
+      term = c('Intercept', levels(data_ordered$bc_group_cluster)[-1]),
+      p.value = format.pval(p.value, 2)
+    ) %>%
+    kbl(caption = 'Smooth (shape) differences by group.') %>%
+    kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>% 
+    print()
+  
+  cat("\n\n")
+  
+}
+```
+
+
+
+### Distances curves (max 200 microns)
+
+```{r bc_group_clusters-ecm-expression-distance-max100, fig.width= 1.2, fig.asp = 0.738}
+ct <- ucell_vars[1]
+for(ct in ucell_vars) {
+  cat("####", ct, "\n\n")
+  
+  res_plot <-  use_data %>% 
+    mutate(r_dist = r_dist_caf_hotspot_3d_transformed) %>% 
+    filter(r_dist < 200) %>%
+    mutate(
+      r_dist = ifelse(r_dist < 0, 0, r_dist)
+    ) %>%
+    ggplot(aes(r_dist/1000, .data[[ct]], color = bc_group_cluster)) +
+    geom_smooth(method = "gam", 
+                formula = y ~ s(x, bs = "cs"),
+                se = FALSE,
+                linewidth = linewidth_default*2) +
+    scale_color_manual(values = bc_group_cluster_palette) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0.15))
+    ) +
+    labs(
+      title = '',
+      x = 'Distance (mm)',
+      y = 'Score',
+      color = ''
+    )  +
+    theme(
+      legend.position = "none",
+      plot.margin = unit(c(-0.1, 0.01, 0, 0.01), "inches")
+    )
+  print(res_plot)
+  cat("\n\n")
+
+}
+
+
+```
+
+#### Statistical test
+
+Use Generalized Additive Models (GAMs) to evaluate relationship between expression and distance across the groups. We used Cubic Regression Splines with shrinkage to allow for automated smoothing parameter selection and to penalize non-significant wiggles toward a zero-effect null space. All models were fitted using Restricted Maximum Likelihood (REML).
+```{r bc_group_clusters-ecm-expression-distanc-max100-test}
+require(mgcv)   # For fitting GAMs
+require(gratia) # For plotting and difference smooths
+
+for(ct in ucell_vars) {
+  cat("####", ct, "\n\n")
+  use_data_test <- use_data %>% 
+    mutate(r_dist = r_dist_caf_hotspot_3d_transformed) %>% 
+    filter(r_dist < 200) %>% 
+    mutate(r_dist = r_dist / 1000,
+           r_dist = ifelse(r_dist < 0, 0, r_dist)) %>% 
+    mutate(Expression = .data[[ct]])
+  
+  # Global assessment, comparing null and full model
+  m_null <- gam(Expression ~ s(r_dist, bs = "cs"), data = use_data_test, method = "REML")
+  m_full <- gam(Expression ~ bc_group_cluster + s(r_dist, by = bc_group_cluster, bs = "cs"), 
+                data = use_data_test, method = "REML")
+  global_test <- anova(m_null, m_full, test = "F")
+  
+  cat("Global Comparison: The overall effect of Condition was assessed by comparing a full model (allowing condition-specific smooths) against a null model (a single smooth for all data) using an Analysis of Deviance (F-test):\n\n")
+  global_test %>% 
+    broom::tidy() %>% 
+    mutate(
+      term = c('Null model', 'Full model'),
+      p.value = format.pval(p.value, 2)
+    ) %>% 
+    kbl(caption = 'Global test for differences in expression-distance curves') %>%
+    kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>% 
+    print()
+  
+  # Specific differences
+  # We convert Condition to an "ordered" factor. 
+  # This tells mgcv to treat the first level as a reference and others as differences.
+  data_ordered <- use_data_test
+  data_ordered$bc_group_cluster <- as.ordered(data_ordered$bc_group_cluster)
+  contrasts(data_ordered$bc_group_cluster) <- "contr.treatment" # Use treatment contrasts
+  
+  m_diff <- gam(Expression ~ bc_group_cluster + s(r_dist, bs = "cs") + 
+                  s(r_dist, by = bc_group_cluster, bs = "cs"), 
+                data = data_ordered, method = "REML")
+  
+  # Extract the parametric table (Intercepts and Magnitude differences)
+  cat("Pairwise Comparison: Parametric coefficients. This table shows the differences in magnitude (the average vertical position of your curves). \n\n")
+  
+  parametric_table <- tidy(m_diff, parametric = TRUE)
+  parametric_table %>% 
+    mutate(
+      term = c('Intercept', levels(data_ordered$bc_group_cluster)[-1]),
+      p.value = format.pval(p.value, 2)
+    ) %>%
+    kbl(caption = 'Parametric (magnitude) differences by group.') %>%
+    kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>% 
+    print()
+  
+  # Extract the Smooth table (Shape/Slope differences)
+  cat("Pairwise Comparison: Smooth terms. This table shows the differences in shape of the relationship between expression and distance. \n\n")
+  smooth_table <- tidy(m_diff, parametric = FALSE)
+  smooth_table %>% 
+    mutate(
+      term = c('Intercept', levels(data_ordered$bc_group_cluster)[-1]),
+      p.value = format.pval(p.value, 2)
+    ) %>%
+    kbl(caption = 'Smooth (shape) differences by group.') %>%
+    kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>% 
+    print()
+  
+  cat("\n\n")
+  
+}
+```
+

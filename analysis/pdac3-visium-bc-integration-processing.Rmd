@@ -1,0 +1,2082 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "Barcodes analysis"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+  ctc_met_bc_se_file: ./data/barcodes/pdac3-ctc-mets/se.rds
+  min_counts: 5
+  min_present_prop: 0.25
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2023.1.Hs
+  ncores: 4
+---
+
+
+
+## Configuration
+
+Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(knitr)
+library(patchwork)
+library(kableExtra)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(UpSetR)
+library(GGally)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(arsenal)
+library(Seurat)
+library(SummarizedExperiment)
+library(semla)
+library(edgeR)
+library(scran)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data processing 
+
+### Load initial data
+
+Load CTC barcodes SummarizedExperiment
+```{r dw-load-ctc-bc-se}
+ctc_met_bc_se <- readRDS(params$ctc_met_bc_se_file)
+ctc_met_bc_se <- ctc_met_bc_se[,ctc_met_bc_se$total_bc>0]
+assay(ctc_met_bc_se, 'cpm') <- edgeR::cpm(assay(ctc_met_bc_se, 'norm_counts'))
+assay(ctc_met_bc_se, 'logcpm') <- edgeR::cpm(assay(ctc_met_bc_se, 'norm_counts'), log = TRUE)
+
+colData(ctc_met_bc_se) <- colData(ctc_met_bc_se) %>% data.frame %>% 
+  mutate(
+    sample_type_grouped = ifelse(grepl('^ctc_cluster', sample_type), 'ctc_cluster', sample_type),
+    sample_type_grouped = ifelse(sample_type == 'ctc_single_pool', 'ctc_single', sample_type_grouped),
+    sample_type_grouped = ifelse(sample_type %in% c('liver', 'lung'), 'metastasis', sample_type_grouped),
+    use_anatomical_origin = ifelse(anatomical_origin == 'cardiac_puncture', 'blood', anatomical_origin),
+    sample_type_origin = paste(sample_type_grouped, use_anatomical_origin, sep = '-'),
+    sample_type_origin = gsub('-lung|-liver', '', sample_type_origin)
+  ) %>% 
+  DataFrame
+
+```
+
+Load human seurat data
+```{r dw-load-seurat}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+
+# Change rownames
+rownames(seu@assays[['Spatial']]) <-  gsub('GRCh38-', '',rownames(seu@assays[['Spatial']]))
+
+i <- 'SCT'
+rownames(seu@assays[[i]]@counts) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@counts))
+rownames(seu@assays[[i]]@data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@data))
+rownames(seu@assays[[i]]@scale.data) <-  gsub('GRCh38-', '', rownames(seu@assays[[i]]@scale.data))
+seu@assays[[i]]@var.features <- gsub('GRCh38-', '', seu@assays[[i]]@var.features)
+```
+
+List of individual seurat files with full features
+```{r dw-list-seurat}
+seurat_files <- list.files(file.path(params$seurat_dir, "seurat"), pattern = "S[0-9]+.*.rds", full.names = TRUE)
+```
+
+
+
+
+### TME distances
+#### CAF distance
+
+Define CAF hotspots. We select spots with Acta2 expression ≥ 1 UMI counts and we define hotspots using an adapted version of  [semla::DisconnectRegions](https://ludvigla.github.io/semla/articles/radial_distances.html#disconnect-regions) to detect singleton spots.We use a scaling factor of 1.3 to define proximity, which means that we consider that two spots are in contact if they are within minimum radial distance * 1.3.
+```{r caf-acta2-hotspots, eval = FALSE}
+
+dir.create(file.path(params$output_dir, 'hotspots_tme'), recursive = TRUE, showWarnings = FALSE)
+
+# Load mouse Seurat
+use_seu <-  readRDS(file.path(params$seurat_dir, 'seurat_mm/seurat_merged_semla.rds'))
+
+# Record Acta2 expression from mouse
+use_seu$acta2_mm <- use_seu[['SCT']]$counts['GRCm39-Acta2',]
+
+# Extract ACTA2 expression from human Seurat
+acta2_hs <- seu[['SCT']]$counts['ACTA2',] %>% 
+  data.frame %>% 
+  set_names('acta2_hs') %>% 
+  rownames_to_column('barcodes')
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcodes') %>% 
+  left_join(acta2_hs, by = 'barcodes') %>% 
+  column_to_rownames('barcodes') %>% 
+  mutate(
+    acta2_hs = ifelse(is.na(acta2_hs), 0, acta2_hs)
+  )
+
+# Sum Acta2 and ACTA2 expression
+use_seu$acta2 <- use_seu$acta2_mm + use_seu$acta2_hs
+
+# Hotspot parameters
+dist_scaling_factor <- 1.3
+expression_threshold <- 2
+
+# Get Staffli object
+spatial_data <- GetStaffli(use_seu)
+
+# Extract coordinates, transformed after image alignment
+use_coords <- spatial_data@meta_data %>% 
+  # we don't use transformed coordinat
+  dplyr::rename(x = pxl_col_in_fullres, y = pxl_row_in_fullres) %>% 
+  dplyr::select(barcode, x, y, sampleID) %>% 
+  as_tibble()
+
+# Select spots with CAF expression
+use_spots <- colnames(use_seu)[use_seu$acta2 >= expression_threshold]
+
+disconnected_spot_labels <- DisconnectRegions.sample(use_coords, use_spots, scaling_factor = dist_scaling_factor, verbose = FALSE)
+
+# Add hotspots size to the data
+hotspot_sizes <- disconnected_spot_labels %>% 
+  group_by(hotspot) %>% 
+  summarise(hotspot_size = n())
+disconnected_spot_labels %<>%
+  left_join(hotspot_sizes, by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(hotspot == 'singleton', 1, hotspot_size))
+
+# Save final hotspot definition
+out_file <- paste0('spots_caf_hotspot_', expression_threshold, '.rds')
+saveRDS(disconnected_spot_labels, file.path(params$output_dir, 'hotspots_tme', out_file))
+
+rm(use_seu)
+```
+
+
+Here we will define the distance of each spot to the nearest CAF spot, which we will use later to define the distance of each barcode hotspot to CAFs. *CHECK DESCRIPTION: We will use the same approach as in the previous analysis, but we will use the spatial coordinates of the spots instead of the UMAP coordinates. We will also use a different threshold for defining CAF spots, which is based on the expression of a CAF marker gene, such as FAP or PDGFRB. We will define CAF spots as those that have at least 1 count of the marker gene in the spatial data. We will then calculate the distance of each spot to the nearest CAF spot using the `semla::GetSpatialNetwork` function, which calculates a spatial network based on the spatial coordinates of the spots and a distance threshold. We will use a distance threshold that is based on the median distance between spots in the spatial data, which we will calculate using the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots.*
+
+WARNNG: What to do with spots that are not in the rd_res because they don't have a CAF hotspots in 2D?
+```{r caf-distance-conf, eval = FALSE}
+use_seu <- seu
+
+# Load CAF spots
+caf_hotspots <- readRDS(file.path(params$seurat_dir, "hotspots_tme", "spots_caf_hotspot_2.rds"))
+caf_bc <- caf_hotspots %>% 
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>% 
+  pull(sample_spot)
+
+# Add CAF hotspots to seurat/semla object
+use_seu$caf_hotspots <- ifelse(colnames(use_seu) %in% caf_bc, 'yes', 'no')
+```
+
+Calculate 2D radial distances to CAF hotspots using original coordinates
+```{r caf-distance-2d, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method. Therefore, we need to manually perform all the pre-processing steps that RadialDistance.Seurat does
+
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+      min(i[[1]]$distance) * scaling_factor
+}
+
+rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+  use_spots <- intersect(caf_bc, use_coords_list[[nm]]$barcode)
+  res <- NULL
+  if(length(use_spots) > 0) {
+    res <- RadialDistance(object = use_coords_list[[nm]],
+                          spots = use_spots,
+                          verbose = TRUE,
+                          convert_to_microns = TRUE,
+                          maxDist = max_distance_list[[nm]]
+    )
+    res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+  }
+  res
+}
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(rd_res, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  dplyr::rename(r_dist_caf_hotspot_2d = r_dist)
+##!!! What to do with spots that are not in the rd_res because they don't have a CAF area?????!!!!!!!!!
+```
+
+Calculate 2D radial distances to CAF hotspots using transformed coordinates and merged slides
+```{r caf-distance-2d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+slide_info <- read_csv(file.path(params$seurat_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Correct slice annotation levels and remove sections not aligned
+slide_info %<>% 
+  filter(!sample_alias %in% c('S1_Y14Y20_336_A1', 'S1_Y14Y20_336_B1')) %>% 
+  mutate(slice_level = ifelse(sample_alias == 'S10_Y14Y20_348_D1', 11, slice_level))
+
+
+# Combine slice levels for the two halves of the same slide, by adding the maximum slice level of the first half to the slice levels of the second half. This way we will have a unique sampleID for each slide, which is necessary to run RadialDistance by sample.
+max_half_1 <- slide_info %>% filter(tumor_half == 1) %>% pull(slice_level) %>% max
+
+slide_info %<>% 
+  mutate(
+    sampleID_c =  slice_level,
+    sampleID_c = ifelse(tumor_half == 2, sampleID_c + max_half_1, sampleID_c)
+  ) %>% 
+  data.frame
+
+# Add SampleID for combined slices to Staffli metadata
+use_coords_list <- GetStaffli(use_seu)@meta_data %>% 
+  mutate(sample_alias = gsub("-.*", "", barcode)) %>%
+  left_join(slide_info %>% 
+              dplyr::select(sample_alias, sampleID_c) , 
+            by = c('sample_alias')) %>% 
+  filter(!is.na(sampleID_c)) %>% 
+  mutate(sampleID = sampleID_c) %>% 
+  select(-sampleID_c, sample_alias) %>% 
+  select(barcode, pxl_col_in_fullres_transformed, 
+         pxl_row_in_fullres_transformed, sampleID) %>% 
+  setNames(c("barcode", "x", "y", "sampleID")) %>% 
+  group_by(sampleID) %>% 
+  group_split() %>% 
+  setNames(nm = paste0(1:max(slide_info$sampleID)))
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+      min(i[[1]]$distance) * scaling_factor
+}
+
+
+rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+  use_spots <- intersect(caf_bc, use_coords_list[[nm]]$barcode)
+  res <- NULL
+  if(length(use_spots) > 0) {
+    res <- RadialDistance(object = use_coords_list[[nm]],
+                          spots = use_spots,
+                          verbose = TRUE,
+                          convert_to_microns = TRUE,
+                          maxDist = max_distance_list[[nm]]
+    )
+    res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+  }
+  res
+}
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(rd_res, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  dplyr::rename(r_dist_caf_hotspot_2d_transformed = r_dist)
+
+##!!! What to do with spots that are not in the rd_res because they don't have a CAF area?????!!!!!!!!!
+```
+
+Calculate 3D radial distances to CAF hotspots using transformed coordinates and merged slides
+```{r caf-distance-3d-trans, eval = FALSE}  
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+# Original coordiantes are in pixels, while z-coordinates are in microns. We need to transform z to pixels. To do so, wee need to know how many pixels represent 100microns gap (center to center), or 55microns, which is the size of the spots. We need to do it by sample, by geting the minimum distance for each sampleusing the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots. The, we will use the average to transform Z coordinates from microns to pixels, and then we will run RadialDistance.3D with the transformed coordinates and the z-coordinates in pixels.
+
+physical_spot_um <- 55
+slide_info <- read_csv(file.path(params$seurat_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Change default coordiantes from Staffli object from raw to transformed
+use_seu@tools$Staffli@meta_data %<>% 
+  mutate(
+    pxl_col_in_fullres_raw = pxl_col_in_fullres,
+    pxl_row_in_fullres_raw = pxl_row_in_fullres,
+    pxl_col_in_fullres = pxl_col_in_fullres_transformed,
+    pxl_row_in_fullres = pxl_row_in_fullres_transformed
+  )
+
+# Convert Z coordiantes to pixels
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+use_seu@meta.data %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(do.call(rbind, use_coords_list) %>% select(-sampleID) ) %>% 
+  mutate(
+    z = z_um / um_per_pxl
+  ) %>% 
+  column_to_rownames('barcode')
+
+# Extract min distance for maxDist parameter
+min_distance_pxl <- foreach(i = spatnet_list) %do% {
+  i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance)
+} %>% unlist %>% mean
+
+# Chang
+use_seu$barcode <- colnames(use_seu)
+use_seu <- RadialDistance3D.Seurat(
+  use_seu,
+  column_name = "caf_hotspots",
+  selected_groups = "yes", 
+  maxDist = min_distance_pxl*3,
+  convert_to_microns = TRUE,
+  remove_singletons = FALSE # False, because column selected already reflects hotspots selected
+)
+
+use_seu[[]] %<>% 
+  dplyr::rename(r_dist_caf_hotspot_3d_transformed = r_dist_yes)
+
+```
+
+Prepare dataset with distance matrix information
+```{r caf-distance-df, eval = FALSE}
+res <- use_seu[[]] %>% 
+  select(barcode, z, r_dist_caf_hotspot_2d, r_dist_caf_hotspot_2d_transformed, r_dist_caf_hotspot_3d_transformed)
+saveRDS(res, file.path(params$output_dir, 'hotspots_tme/caf_hotspot_r_dist.rds'))
+```
+
+Load dataset and add CAF distance to seurat object
+```{r caf-distance-df-load}
+caf_hotspot_r_dist <- readRDS(file.path(params$output_dir, 'hotspots_tme/caf_hotspot_r_dist.rds'))
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(caf_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+```
+
+
+#### Lyve1 distance
+
+Define Lyve1 hotspots. We select spots with Lyve1 expression ≥ 1 UMI counts and we define hotspots using an adapted version of  [semla::DisconnectRegions](https://ludvigla.github.io/semla/articles/radial_distances.html#disconnect-regions) to detect singleton spots.We use a scaling factor of 1.3 to define proximity, which means that we consider that two spots are in contact if they are within minimum radial distance * 1.3.
+
+```{r caf-lyve1-hotspots, eval = FALSE}
+dir.create(file.path(params$output_dir, 'hotspots_tme'), recursive = TRUE, showWarnings = FALSE)
+
+# Load mouse Seurat
+use_seu <-  readRDS(file.path(params$seurat_dir, 'seurat_mm/seurat_merged_semla.rds'))
+
+# Record Acta2 expression from mouse
+use_seu$lyve1 <- use_seu[['SCT']]$counts['GRCm39-Lyve1',]
+
+# Hotspot parameters
+dist_scaling_factor <- 1.3
+expression_threshold <- 1
+
+# Get Staffli object
+spatial_data <- GetStaffli(use_seu)
+
+# Extract coordinates, transformed after image alignment
+use_coords <- spatial_data@meta_data %>% 
+  # we don't use transformed coordinat
+  dplyr::rename(x = pxl_col_in_fullres, y = pxl_row_in_fullres) %>% 
+  dplyr::select(barcode, x, y, sampleID) %>% 
+  as_tibble()
+
+# Select spots with CAF expression
+use_spots <- colnames(use_seu)[use_seu$acta2 >= expression_threshold]
+
+disconnected_spot_labels <- DisconnectRegions.sample(use_coords, use_spots, scaling_factor = dist_scaling_factor, verbose = FALSE)
+
+# Add hotspots size to the data
+hotspot_sizes <- disconnected_spot_labels %>% 
+  group_by(hotspot) %>% 
+  summarise(hotspot_size = n())
+disconnected_spot_labels %<>%
+  left_join(hotspot_sizes, by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(hotspot == 'singleton', 1, hotspot_size))
+
+# Save final hotspot definition
+out_file <- paste0('spots_lyve1_hotspot_', expression_threshold, '.rds')
+saveRDS(disconnected_spot_labels, file.path(params$output_dir, 'hotspots_tme', out_file))
+
+rm(use_seu)
+```
+
+
+```{r lyve1-distance-conf, eval = FALSE}
+use_seu <- seu
+
+# Load spots
+lyve1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_lyve1_hotspot_1.rds"))
+lyve1_bc <- lyve1_hotspots %>% 
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>% 
+  pull(sample_spot)
+
+# Add Lyve1 hotspots to seurat/semla object
+use_seu$lyve1_hotspots <- ifelse(colnames(use_seu) %in% lyve1_bc, 'yes', 'no')
+# seu[[]] %>% filter(!is.na(lyve1_bc)) %>% pull(sample_alias) %>% table
+```
+
+Calculate 2D radial distances to Lyve1 hotspots using original coordinates
+```{r lyve1-distance-2d, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method. Therefore, we need to manually perform all the pre-processing steps that RadialDistance.Seurat does
+
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+      min(i[[1]]$distance) * scaling_factor
+}
+
+rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+  use_spots <- intersect(lyve1_bc, use_coords_list[[nm]]$barcode)
+  res <- NULL
+  if(length(use_spots) > 0) {
+    res <- RadialDistance(object = use_coords_list[[nm]],
+                          spots = use_spots,
+                          verbose = TRUE,
+                          convert_to_microns = TRUE,
+                          maxDist = max_distance_list[[nm]]
+    )
+    res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+  }
+  res
+}
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(rd_res, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  dplyr::rename(r_dist_lyve1_hotspot_2d = r_dist)
+```
+
+Calculate 2D radial distances to Lyve1 hotspots using transformed coordinates and merged slides
+```{r lyve1-distance-2d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+slide_info <- read_csv(file.path(params$output_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Correct slice annotation levels and remove sections not aligned
+slide_info %<>% 
+  filter(!sample_alias %in% c('S1_Y14Y20_336_A1', 'S1_Y14Y20_336_B1')) %>% 
+  mutate(slice_level = ifelse(sample_alias == 'S10_Y14Y20_348_D1', 11, slice_level))
+
+
+# Combine slice levels for the two halves of the same slide, by adding the maximum slice level of the first half to the slice levels of the second half. This way we will have a unique sampleID for each slide, which is necessary to run RadialDistance by sample.
+max_half_1 <- slide_info %>% filter(tumor_half == 1) %>% pull(slice_level) %>% max
+
+slide_info %<>% 
+  mutate(
+    sampleID_c =  slice_level,
+    sampleID_c = ifelse(tumor_half == 2, sampleID_c + max_half_1, sampleID_c)
+  ) %>% 
+  data.frame
+
+# Add SampleID for combined slices to Staffli metadata
+use_coords_list <- GetStaffli(use_seu)@meta_data %>% 
+  mutate(sample_alias = gsub("-.*", "", barcode)) %>%
+  left_join(slide_info %>% 
+              dplyr::select(sample_alias, sampleID_c) , 
+            by = c('sample_alias')) %>% 
+  filter(!is.na(sampleID_c)) %>% 
+  mutate(sampleID = sampleID_c) %>% 
+  select(-sampleID_c, sample_alias) %>% 
+  select(barcode, pxl_col_in_fullres_transformed, 
+         pxl_row_in_fullres_transformed, sampleID) %>% 
+  setNames(c("barcode", "x", "y", "sampleID")) %>% 
+  group_by(sampleID) %>% 
+  group_split() %>% 
+  setNames(nm = paste0(1:max(slide_info$sampleID)))
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+      min(i[[1]]$distance) * scaling_factor
+}
+
+
+rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+  use_spots <- intersect(lyve1_bc, use_coords_list[[nm]]$barcode)
+  res <- NULL
+  if(length(use_spots) > 0) {
+    res <- RadialDistance(object = use_coords_list[[nm]],
+                          spots = use_spots,
+                          verbose = TRUE,
+                          convert_to_microns = TRUE,
+                          maxDist = max_distance_list[[nm]]
+    )
+    res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+  }
+  res
+}
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(rd_res, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  dplyr::rename(r_dist_lyve1_hotspot_2d_transformed = r_dist)
+
+```
+
+Calculate 3D radial distances to Lyve1 hotspots using transformed coordinates and merged slides
+```{r lyve1-distance-3d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+# Original coordiantes are in pixels, while z-coordinates are in microns. We need to transform z to pixels. To do so, wee need to know how many pixels represent 100microns gap (center to center), or 55microns, which is the size of the spots. We need to do it by sample, by geting the minimum distance for each sampleusing the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots. The, we will use the average to transform Z coordinates from microns to pixels, and then we will run RadialDistance.3D with the transformed coordinates and the z-coordinates in pixels.
+
+physical_spot_um <- 55
+slide_info <- read_csv(file.path(params$output_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Change default coordiantes from Staffli object from raw to transformed
+use_seu@tools$Staffli@meta_data %<>% 
+  mutate(
+    pxl_col_in_fullres_raw = pxl_col_in_fullres,
+    pxl_row_in_fullres_raw = pxl_row_in_fullres,
+    pxl_col_in_fullres = pxl_col_in_fullres_transformed,
+    pxl_row_in_fullres = pxl_row_in_fullres_transformed
+  )
+
+# Convert Z coordiantes to pixels
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+use_seu@meta.data %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(do.call(rbind, use_coords_list) %>% select(-sampleID) ) %>% 
+  mutate(
+    z = z_um / um_per_pxl
+  ) %>% 
+  column_to_rownames('barcode')
+
+# Extract min distance for maxDist parameter
+min_distance_pxl <- foreach(i = spatnet_list) %do% {
+  i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance)
+} %>% unlist %>% mean
+
+# Chang
+use_seu$barcode <- colnames(use_seu)
+use_seu <- RadialDistance3D.Seurat(
+  use_seu,
+  column_name = "lyve1_hotspots",
+  selected_groups = "yes", 
+  maxDist = min_distance_pxl*3,
+  convert_to_microns = TRUE,
+  remove_singletons = FALSE # False, because column selected already reflects hotspots selected
+)
+
+use_seu[[]] %<>% 
+  dplyr::rename(r_dist_lyve1_hotspot_3d_transformed = r_dist_yes)
+
+```
+
+Prepare dataset with distance matrix information
+```{r lyve1-distance-df, eval = FALSE}
+res <- use_seu[[]] %>% 
+  select(barcode, r_dist_lyve1_hotspot_2d, r_dist_lyve1_hotspot_2d_transformed, r_dist_lyve1_hotspot_3d_transformed)
+saveRDS(res, file.path(params$output_dir, 'hotspots_tme/lyve1_hotspot_r_dist.rds'))
+```
+
+Load dataset and add Lyve1 distance to seurat object
+```{r lyve1-distance-df-load}
+lyve1_hotspot_r_dist <- readRDS(file.path(params$output_dir, 'hotspots_tme/lyve1_hotspot_r_dist.rds'))
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(lyve1_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+```
+
+#### Pecam1 distance
+Define Lyve1 hotspots. We select spots with Lyve1 expression ≥ 1 UMI counts and we define hotspots using an adapted version of  [semla::DisconnectRegions](https://ludvigla.github.io/semla/articles/radial_distances.html#disconnect-regions) to detect singleton spots.We use a scaling factor of 1.3 to define proximity, which means that we consider that two spots are in contact if they are within minimum radial distance * 1.3.
+
+```{r caf-pecam1-hotspots, eval = FALSE}
+dir.create(file.path(params$output_dir, 'hotspots_tme'), recursive = TRUE, showWarnings = FALSE)
+
+# Load mouse Seurat
+use_seu <-  readRDS(file.path(params$seurat_dir, 'seurat_mm/seurat_merged_semla.rds'))
+
+# Record Acta2 expression from mouse
+use_seu$lyve1 <- use_seu[['SCT']]$counts['GRCm39-Pecam1',]
+
+# Hotspot parameters
+dist_scaling_factor <- 1.3
+expression_threshold <- 1
+
+# Get Staffli object
+spatial_data <- GetStaffli(use_seu)
+
+# Extract coordinates, transformed after image alignment
+use_coords <- spatial_data@meta_data %>% 
+  # we don't use transformed coordinat
+  dplyr::rename(x = pxl_col_in_fullres, y = pxl_row_in_fullres) %>% 
+  dplyr::select(barcode, x, y, sampleID) %>% 
+  as_tibble()
+
+# Select spots with CAF expression
+use_spots <- colnames(use_seu)[use_seu$acta2 >= expression_threshold]
+
+disconnected_spot_labels <- DisconnectRegions.sample(use_coords, use_spots, scaling_factor = dist_scaling_factor, verbose = FALSE)
+
+# Add hotspots size to the data
+hotspot_sizes <- disconnected_spot_labels %>% 
+  group_by(hotspot) %>% 
+  summarise(hotspot_size = n())
+disconnected_spot_labels %<>%
+  left_join(hotspot_sizes, by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(hotspot == 'singleton', 1, hotspot_size))
+
+# Save final hotspot definition
+out_file <- paste0('spots_pecam1_hotspot_', expression_threshold, '.rds')
+saveRDS(disconnected_spot_labels, file.path(params$output_dir, 'hotspots_tme', out_file))
+
+rm(use_seu)
+```
+
+
+```{r pecam1-distance-conf, eval = FALSE}
+use_seu <- seu
+
+# Load spots
+pecam1_hotspots <- readRDS(file.path(params$output_dir, 'hotspots_tme', "spots_pecam1_hotspot_1.rds"))
+pecam1_bc <- pecam1_hotspots %>% 
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>% 
+  pull(sample_spot)
+
+# Add Pecam1 hotspots to seurat/semla object
+use_seu$pecam1_hotspots <- ifelse(colnames(use_seu) %in% pecam1_bc, 'yes', 'no')
+# seu[[]] %>% filter(!is.na(pecam1_bc)) %>% pull(sample_alias) %>% table
+```
+
+Calculate 2D radial distances to Pecam1 hotspots using original coordinates
+```{r pecam1-distance-2d, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method. Therefore, we need to manually perform all the pre-processing steps that RadialDistance.Seurat does
+
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+      min(i[[1]]$distance) * scaling_factor
+}
+
+rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+  use_spots <- intersect(pecam1_bc, use_coords_list[[nm]]$barcode)
+  res <- NULL
+  if(length(use_spots) > 0) {
+    res <- RadialDistance(object = use_coords_list[[nm]],
+                          spots = use_spots,
+                          verbose = TRUE,
+                          convert_to_microns = TRUE,
+                          maxDist = max_distance_list[[nm]]
+    )
+    res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+  }
+  res
+}
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(rd_res, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  dplyr::rename(r_dist_pecam1_hotspot_2d = r_dist)
+```
+
+Calculate 2D radial distances to Pecam1 hotspots using transformed coordinates and merged slides
+```{r pecam1-distance-2d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+slide_info <- read_csv(file.path(params$output_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Correct slice annotation levels and remove sections not aligned
+slide_info %<>% 
+  filter(!sample_alias %in% c('S1_Y14Y20_336_A1', 'S1_Y14Y20_336_B1')) %>% 
+  mutate(slice_level = ifelse(sample_alias == 'S10_Y14Y20_348_D1', 11, slice_level))
+
+
+# Combine slice levels for the two halves of the same slide, by adding the maximum slice level of the first half to the slice levels of the second half. This way we will have a unique sampleID for each slide, which is necessary to run RadialDistance by sample.
+max_half_1 <- slide_info %>% filter(tumor_half == 1) %>% pull(slice_level) %>% max
+
+slide_info %<>% 
+  mutate(
+    sampleID_c =  slice_level,
+    sampleID_c = ifelse(tumor_half == 2, sampleID_c + max_half_1, sampleID_c)
+  ) %>% 
+  data.frame
+
+# Add SampleID for combined slices to Staffli metadata
+use_coords_list <- GetStaffli(use_seu)@meta_data %>% 
+  mutate(sample_alias = gsub("-.*", "", barcode)) %>%
+  left_join(slide_info %>% 
+              dplyr::select(sample_alias, sampleID_c) , 
+            by = c('sample_alias')) %>% 
+  filter(!is.na(sampleID_c)) %>% 
+  mutate(sampleID = sampleID_c) %>% 
+  select(-sampleID_c, sample_alias) %>% 
+  select(barcode, pxl_col_in_fullres_transformed, 
+         pxl_row_in_fullres_transformed, sampleID) %>% 
+  setNames(c("barcode", "x", "y", "sampleID")) %>% 
+  group_by(sampleID) %>% 
+  group_split() %>% 
+  setNames(nm = paste0(1:max(slide_info$sampleID)))
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+      min(i[[1]]$distance) * scaling_factor
+}
+
+
+rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+  use_spots <- intersect(pecam1_bc, use_coords_list[[nm]]$barcode)
+  res <- NULL
+  if(length(use_spots) > 0) {
+    res <- RadialDistance(object = use_coords_list[[nm]],
+                          spots = use_spots,
+                          verbose = TRUE,
+                          convert_to_microns = TRUE,
+                          maxDist = max_distance_list[[nm]]
+    )
+    res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+  }
+  res
+}
+
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(rd_res, by = 'barcode') %>%
+  column_to_rownames('barcode') %>% 
+  dplyr::rename(r_dist_pecam1_hotspot_2d_transformed = r_dist)
+
+```
+
+Calculate 3D radial distances to Pecam1 hotspots using transformed coordinates and merged slides
+```{r pecam1-distance-3d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+# Original coordiantes are in pixels, while z-coordinates are in microns. We need to transform z to pixels. To do so, wee need to know how many pixels represent 100microns gap (center to center), or 55microns, which is the size of the spots. We need to do it by sample, by geting the minimum distance for each sampleusing the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots. The, we will use the average to transform Z coordinates from microns to pixels, and then we will run RadialDistance.3D with the transformed coordinates and the z-coordinates in pixels.
+
+physical_spot_um <- 55
+slide_info <- read_csv(file.path(params$output_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Change default coordiantes from Staffli object from raw to transformed
+use_seu@tools$Staffli@meta_data %<>% 
+  mutate(
+    pxl_col_in_fullres_raw = pxl_col_in_fullres,
+    pxl_row_in_fullres_raw = pxl_row_in_fullres,
+    pxl_col_in_fullres = pxl_col_in_fullres_transformed,
+    pxl_row_in_fullres = pxl_row_in_fullres_transformed
+  )
+
+# Convert Z coordiantes to pixels
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+use_seu@meta.data %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(do.call(rbind, use_coords_list) %>% select(-sampleID) ) %>% 
+  mutate(
+    z = z_um / um_per_pxl
+  ) %>% 
+  column_to_rownames('barcode')
+
+# Extract min distance for maxDist parameter
+min_distance_pxl <- foreach(i = spatnet_list) %do% {
+  i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance)
+} %>% unlist %>% mean
+
+# Chang
+use_seu$barcode <- colnames(use_seu)
+use_seu <- RadialDistance3D.Seurat(
+  use_seu,
+  column_name = "pecam1_hotspots",
+  selected_groups = "yes", 
+  maxDist = min_distance_pxl*3,
+  convert_to_microns = TRUE,
+  remove_singletons = FALSE # False, because column selected already reflects hotspots selected
+)
+
+use_seu[[]] %<>% 
+  dplyr::rename(r_dist_pecam1_hotspot_3d_transformed = r_dist_yes)
+
+```
+
+Prepare dataset with distance matrix information
+```{r pecam1-distance-df, eval = FALSE}
+res <- use_seu[[]] %>% 
+  select(barcode, r_dist_pecam1_hotspot_2d, r_dist_pecam1_hotspot_2d_transformed, r_dist_pecam1_hotspot_3d_transformed)
+saveRDS(res, file.path(params$output_dir, 'hotspots_tme/pecam1_hotspot_r_dist.rds'))
+```
+
+Load dataset and add Pecam1 distance to seurat object
+```{r pecam1-distance-df-load}
+pecam1_hotspot_r_dist <- readRDS(file.path(params$output_dir, 'hotspots_tme/pecam1_hotspot_r_dist.rds'))
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(pecam1_hotspot_r_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+```
+
+#### Deconvolution cell types
+```{r deconv-distance-conf, eval = FALSE}
+use_seu <- seu
+
+# Load deconvolution data
+rctd_multi_df <- readRDS(file.path(params$output_dir, 'seurat_mm', 'rctd_multi_df_tabmuris.rds'))
+
+# Group cell types
+rctd_multi_df %<>% 
+  mutate(
+    cell_type_grouped = case_when(
+      grepl('monocyte', cell_type) ~ 'monocyte',
+      grepl('epithelial', cell_type) ~ 'epithelial cell',
+      grepl('macrophage', cell_type) ~ 'macrophage',
+      grepl('endothelial', cell_type) ~ 'endothelial cell',
+      grepl('B cell', cell_type) ~ 'B cell',
+      grepl('T cell', cell_type) ~ 'T cell',
+      .default = cell_type
+      )
+  )
+
+# Remove cell types with less than 100 spots
+use_cell_type <- rctd_multi_df$cell_type_grouped %>% table %>% data.frame %>% set_names(c('cell_type', 'Freq')) %>% filter(Freq > 100)
+rctd_multi_df %<>% 
+  filter(cell_type_grouped %in% use_cell_type$cell_type)
+
+# Remove cell types that are not of interest
+rctd_multi_df %<>% 
+  filter(!cell_type_grouped %in% c('epithelial cell', 'kidney cell', 'bladder urothelial cell', 
+                                   'skeletal muscle satellite cell', 'hepatocyte', 'type II pneumocyte',
+                                   'mesangial cell', 'basal cell', 'endocardial cell', 'bladder cell'))
+# Factorize cell types by frequency
+rctd_multi_df %<>% 
+  mutate(cell_type_grouped = fct_infreq(cell_type_grouped))
+
+# save modified rctd_multi_df
+saveRDS(rctd_multi_df, file.path(params$output_dir, 'seurat_mm', 'rctd_multi_df_tabmuris_filtered.rds'))
+```
+
+Calculate 2D radial distances to deconvolution cell types using original coordinates. We remove singleton spots, so we are only using spots that are in a neighborhood with other spots of the same cell type.
+```{r deconv-distance-2d, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method. Therefore, we need to manually perform all the pre-processing steps that RadialDistance.Seurat does
+
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+  min(i[[1]]$distance) * scaling_factor
+}
+
+ct_levels <- rctd_multi_df %>% filter(confidence) %>% pull(cell_type_grouped) %>% unique()
+ct <- ct_levels[1]
+rd_res_ct <- foreach(ct = ct_levels) %do% {
+  ct_spots <- rctd_multi_df %>% filter(cell_type_grouped == ct & confidence == TRUE) %>% pull(barcode)
+  rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+    use_spots <- intersect(ct_spots, use_coords_list[[nm]]$barcode)
+    res <- NULL
+    if(length(use_spots) > 0) {
+      res <- RadialDistance(object = use_coords_list[[nm]],
+                            spots = use_spots,
+                            verbose = TRUE,
+                            convert_to_microns = TRUE,
+                            remove_singletons = TRUE,
+                            maxDist = max_distance_list[[nm]]
+      )
+      res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+    }
+    res
+  }
+  
+  rd_res %<>%  set_names(c('barcode', paste0('r_dist_deconv_2d_', ct)))
+  return(rd_res)
+}
+names(rd_res_ct) <- ct_levels
+
+for(i in rd_res_ct) {
+  use_seu[[]] %<>% 
+    rownames_to_column('barcode') %>%
+    left_join(i, by = 'barcode') %>%
+    column_to_rownames('barcode')
+}
+```
+
+Calculate 3D radial distances to deconvolution cell types using transformed coordinates and merged slides. We remove singleton spots, so we are only using spots that are in a neighborhood with other spots of the same cell type.
+```{r deconv-distance-3d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+# Original coordiantes are in pixels, while z-coordinates are in microns. We need to transform z to pixels. To do so, wee need to know how many pixels represent 100microns gap (center to center), or 55microns, which is the size of the spots. We need to do it by sample, by geting the minimum distance for each sampleusing the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots. The, we will use the average to transform Z coordinates from microns to pixels, and then we will run RadialDistance.3D with the transformed coordinates and the z-coordinates in pixels.
+
+physical_spot_um <- 55
+slide_info <- read_csv(file.path(params$output_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Change default coordiantes from Staffli object from raw to transformed
+use_seu@tools$Staffli@meta_data %<>% 
+  mutate(
+    pxl_col_in_fullres_raw = pxl_col_in_fullres,
+    pxl_row_in_fullres_raw = pxl_row_in_fullres,
+    pxl_col_in_fullres = pxl_col_in_fullres_transformed,
+    pxl_row_in_fullres = pxl_row_in_fullres_transformed
+  )
+
+# Convert Z coordiantes to pixels
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+use_seu@meta.data %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(do.call(rbind, use_coords_list) %>% select(-sampleID) ) %>% 
+  mutate(
+    z = z_um / um_per_pxl
+  ) %>% 
+  column_to_rownames('barcode')
+
+# Extract min distance for maxDist parameter
+min_distance_pxl <- foreach(i = spatnet_list) %do% {
+  i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance)
+} %>% unlist %>% mean
+
+# Change
+use_seu$barcode <- colnames(use_seu)
+
+ct_levels <- rctd_multi_df %>% filter(confidence) %>% pull(cell_type_grouped) %>% unique()
+ct <- ct_levels[1]
+for(ct in ct_levels) {
+  ct_spots <- rctd_multi_df %>% filter(cell_type_grouped == ct & confidence == TRUE) %>% pull(barcode)
+  use_seu$ct_spots <- ifelse(colnames(use_seu) %in% ct_spots, 'yes', 'no')
+  use_seu$z <- use_seu$z - min(use_seu$z)
+
+  use_seu <- RadialDistance3D.Seurat(
+    use_seu,
+    column_name = "ct_spots",
+    selected_groups = "yes", 
+    maxDist = min_distance_pxl*3,
+    convert_to_microns = TRUE,
+    remove_singletons = TRUE
+  )
+  new_var_name <- paste0('r_dist_deconv_3d_', ct)
+  use_seu[[]] %<>% 
+    dplyr::rename_with(~ new_var_name, r_dist_yes)
+  use_seu$ct_spots <- NULL
+  use_seu$r_dist_yes <- NULL
+}
+```
+
+
+Prepare dataset with distance matrix information
+```{r deconv-distance-df, eval = FALSE}
+res <- use_seu[[]] %>% 
+  select(barcode, starts_with('r_dist_deconv'))
+saveRDS(res, file.path(params$output_dir, 'seurat_mm', 'rctd_multi_df_tabmuris_r_dist.rds'))
+```
+
+
+
+#### CAF subtypes distance
+```{r caf_sub-distance-conf, eval = FALSE}
+use_seu <- seu
+
+# Load CAF subtypes data
+caf_mk <- readRDS(file.path(params$seurat_dir, "caf", 'caf_subtypes_markers.rds'))
+fb_subtypes_data <- readRDS(file.path(params$seurat_dir, "caf", 'ucell_fibroblast_subtypes.rds'))
+
+ct <- caf_mk$mm %>% names %>% paste0('_spot')
+
+fb_subtypes_celltype <- fb_subtypes_data %>% 
+  select(barcode, all_of(ct)) %>% 
+  pivot_longer(cols = -barcode, names_to = 'cell_type', values_to = 'spot') %>% 
+  filter(spot) %>% 
+  mutate(
+    cell_type = gsub("_spot", "", cell_type),
+    cell_type = gsub("FB", "Fibroblast", cell_type),
+    cell_type = factor(cell_type)
+  )
+```
+
+
+Calculate 2D radial distances to cell types using original coordinates. We remove singleton spots, so we are only using spots that are in a neighborhood with other spots of the same cell type.
+```{r caf_sub-distance-2d, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method. Therefore, we need to manually perform all the pre-processing steps that RadialDistance.Seurat does
+
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork)
+scaling_factor <- 3
+max_distance_list <- foreach(i = spatnet_list) %do% {
+  min(i[[1]]$distance) * scaling_factor
+}
+
+ct <- levels(fb_subtypes_celltype$cell_type)[1]
+rd_res_ct <- foreach(ct = levels(fb_subtypes_celltype$cell_type)) %do% {
+  ct_spots <- fb_subtypes_celltype %>% filter(cell_type == ct) %>% pull(barcode) %>% 
+    unique
+  rd_res <- foreach(nm = 1:length(use_coords_list), .combine = rbind) %do% {
+    use_spots <- intersect(ct_spots, use_coords_list[[nm]]$barcode)
+    res <- NULL
+    if(length(use_spots) > 0) {
+      res <- RadialDistance(object = use_coords_list[[nm]],
+                            spots = use_spots,
+                            verbose = TRUE,
+                            convert_to_microns = TRUE,
+                            remove_singletons = TRUE,
+                            maxDist = max_distance_list[[nm]]
+      )
+      res %<>% data.frame %>% set_names('r_dist') %>% rownames_to_column('barcode')
+    }
+    res
+  }
+  
+  rd_res %<>%  set_names(c('barcode', paste0('r_dist_cafst_2d_', ct)))
+  return(rd_res)
+}
+names(rd_res_ct) <- levels(fb_subtypes_celltype$cell_type)
+
+for(i in rd_res_ct) {
+  use_seu[[]] %<>% 
+    rownames_to_column('barcode') %>%
+    left_join(i, by = 'barcode') %>%
+    column_to_rownames('barcode')
+}
+```
+
+Calculate 3D radial distances to  cell types using transformed coordinates and merged slides. We remove singleton spots, so we are only using spots that are in a neighborhood with other spots of the same cell type.
+```{r caf_sub-distance-3d-trans, eval = FALSE}
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+# Original coordiantes are in pixels, while z-coordinates are in microns. We need to transform z to pixels. To do so, wee need to know how many pixels represent 100microns gap (center to center), or 55microns, which is the size of the spots. We need to do it by sample, by geting the minimum distance for each sampleusing the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots. The, we will use the average to transform Z coordinates from microns to pixels, and then we will run RadialDistance.3D with the transformed coordinates and the z-coordinates in pixels.
+
+physical_spot_um <- 55
+slide_info <- read_csv(file.path(params$output_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Change default coordiantes from Staffli object from raw to transformed
+use_seu@tools$Staffli@meta_data %<>% 
+  mutate(
+    pxl_col_in_fullres_raw = pxl_col_in_fullres,
+    pxl_row_in_fullres_raw = pxl_row_in_fullres,
+    pxl_col_in_fullres = pxl_col_in_fullres_transformed,
+    pxl_row_in_fullres = pxl_row_in_fullres_transformed
+  )
+
+# Convert Z coordiantes to pixels
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+use_seu@meta.data %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(do.call(rbind, use_coords_list) %>% select(-sampleID) ) %>% 
+  mutate(
+    z = z_um / um_per_pxl
+  ) %>% 
+  column_to_rownames('barcode')
+
+# Extract min distance for maxDist parameter
+min_distance_pxl <- foreach(i = spatnet_list) %do% {
+  i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance)
+} %>% unlist %>% mean
+
+# Change
+use_seu$barcode <- colnames(use_seu)
+
+ct <- levels(fb_subtypes_celltype$cell_type)[1]
+for(ct in levels(fb_subtypes_celltype$cell_type)) {
+  ct_spots <- fb_subtypes_celltype %>% filter(cell_type == ct) %>% pull(barcode) %>% 
+    unique
+  use_seu$ct_spots <- ifelse(colnames(use_seu) %in% ct_spots, 'yes', 'no')
+  use_seu$z <- use_seu$z - min(use_seu$z)
+
+  use_seu <- RadialDistance3D.Seurat(
+    use_seu,
+    column_name = "ct_spots",
+    selected_groups = "yes", 
+    maxDist = min_distance_pxl*3,
+    convert_to_microns = TRUE,
+    remove_singletons = TRUE
+  )
+  new_var_name <- paste0('r_dist_cafst_3d_', ct)
+  use_seu[[]] %<>% 
+    dplyr::rename_with(~ new_var_name, r_dist_yes)
+  use_seu$ct_spots <- NULL
+  use_seu$r_dist_yes <- NULL
+}
+```
+
+Prepare dataset with distance matrix information
+```{r caf_sub-distance-df, eval = FALSE}
+res <- use_seu[[]] %>% 
+  select(barcode, starts_with('r_dist_cafst'))
+saveRDS(res, file.path(params$output_dir, 'caf/caf_subtypes_r_dist.rds'))
+```
+
+
+
+
+### Process barcodes
+
+Spatial transcriptomics : Generate data.frame of number of spots where each barcode is detected by sample. We consider a barcode as detected in a spot if it has at least 2 counts in that spot. We then merge the data.frames for each sample into a single data.frame with the number of spots where each barcode is detected in each sample. We also replace NA values with 0, which means that the barcode was not detected in any spot of that sample.
+
+```{r dw-bc-spot-freq-spatial, eval = FALSE}
+# Read BC spot frequency
+i <- seurat_files[5]
+bc_spot_freq_list <- foreach(i = seurat_files) %do% {
+  use_seurat <- readRDS(i)
+  use_sample_alias <- basename(i) %>% gsub('\\.rds', '', .)
+  use_features <- use_seurat[['Spatial']]@meta.data %>% 
+    filter(organism == 'barcode') %>% 
+    pull('gene_name_sp')
+  res <- rowSums(use_seurat[['Spatial']]$counts[use_features,] >= 2) %>% 
+    data.frame %>% 
+    set_names(use_sample_alias) %>% 
+    rownames_to_column('bc')
+  return(res)
+}
+
+# Merge BC spot frequency
+bc_spot_freq <- Reduce(full_join, bc_spot_freq_list)
+bc_spot_freq[is.na(bc_spot_freq)] <- 0
+saveRDS(bc_spot_freq, file.path(params$output_dir, 'seurat/bc_spot_freq.rds'))
+```
+
+```{r dw-bc-spot-freq-spatial-load}
+bc_spot_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_spot_freq.rds'))
+```
+
+Celltracker barcodes : Generate data.frame with the number of spots where each barcode is detected in total and frequencies in the RNA-seq samples from CTCs, CTO and mets. Here we use a CPM threshold of 1000 to consider a barcode as detected in a sample, which is equivalent to 5 counts in a sample with 5 million total counts. We also calculate the mean CPM and total CPM for each barcode in each sample type group.
+
+```{r dw-bc-ctc-spot-freq-combined, eval = FALSE}
+use_cpm_threshold <- 1000
+use_se <- ctc_met_bc_se
+
+# Keep only data from the mouse used for spatial analysis
+use_se <- use_se[,!is.na(use_se$mouse_id)]
+use_se <- use_se[,use_se$mouse_id == '#2']
+  
+# Initialize data.frame with barcodes
+bc_freq <- data.frame(
+  bc = bc_spot_freq$bc,
+  n_spots = bc_spot_freq %>% dplyr::select(-bc) %>% rowSums
+)
+
+# Barcodes frequencies by sample_type
+i_levels <- c('ctc_single', 'ctc_cluster', 'cto', 'metastasis')
+i <- 'ctc_cluster'
+for (i in i_levels) {
+  use_cols <- use_se$sample_type_grouped == i
+  res_data <- data.frame(bc = rownames(use_se))
+  res_data[[paste(i, 'cpm_total', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') , na.rm = TRUE)
+  res_data[[paste(i, 'cpm_mean', sep = '.')]] <- rowMeans(assay(use_se[,use_cols], 'cpm') , na.rm = TRUE)
+  res_data[[paste(i, 'freq', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') >= use_cpm_threshold , na.rm = TRUE)
+   res_data[[paste(i, 'prop', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') >= use_cpm_threshold , na.rm = TRUE) / sum(use_cols)
+  bc_freq <- full_join(bc_freq, res_data, by = 'bc')
+}
+
+# Barcodes frequencies in all samples
+use_cols <- use_se$sample_type_grouped %in% i_levels
+res_data <- data.frame(bc = rownames(use_se))
+res_data[[paste('total', 'cpm_total', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') , na.rm = TRUE)
+res_data[[paste('total', 'cpm_mean', sep = '.')]] <- rowMeans(assay(use_se[,use_cols], 'cpm') , na.rm = TRUE)
+res_data[[paste('total', 'freq', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') >= use_cpm_threshold , na.rm = TRUE)
+res_data[[paste('total', 'prop', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') >= use_cpm_threshold , na.rm = TRUE) / sum(use_cols)
+bc_freq <- full_join(bc_freq, res_data, by = 'bc')
+
+# Barcode frequencies by anatomical origin
+i_levels <- c("ctc_single-blood", "ctc_cluster-blood", "ctc_cluster-ascites", "cto-ascites", "ctc_single-ascites", "cto-blood")
+i <- i_levels[1]
+for (i in i_levels) {
+  use_cols <- use_se$sample_type_origin == i
+  res_data <- data.frame(bc = rownames(use_se))
+  res_data[[paste(i, 'cpm_total', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') , na.rm = TRUE)
+  res_data[[paste(i, 'cpm_mean', sep = '.')]] <- rowMeans(assay(use_se[,use_cols], 'cpm') , na.rm = TRUE)
+  res_data[[paste(i, 'freq', sep = '.')]] <- rowSums(assay(use_se[,use_cols], 'cpm') >= use_cpm_threshold , na.rm = TRUE)
+  bc_freq <- full_join(bc_freq, res_data, by = 'bc')
+}
+
+bc_freq[is.na(bc_freq)] <- 0
+
+saveRDS(bc_freq, file.path(params$output_dir, 'seurat/bc_freq.rds'))
+```
+
+
+Classify barcodes based on the presence in CTC and metastasis. We classify barcodes as specific to spatial transcriptomics if they are not detected in any of the CTC or metastasis sample type groups. Detected means that freq is 0 across samples, with a threshold of 100 CPM. We also select the top 10 barcodes for each sample type group based on the total CPM in that group, that are also present in ST (n_spots >= 50). We then take the unique set of barcodes that are in the top 10 of any of the sample type groups. We use this set of barcodes to classify the barcodes based on their presence in CTC and metastasis.
+
+```{r dw-bc-spot-freq-combined-classify, eval = FALSE}
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+
+# We select the top 10 barcodes for each sample type group based on the total CPM in that group, that are also present in ST (n_spots >= 50). We then take the unique set of barcodes that are in the top 10 of any of the sample type groups. We use this set of barcodes to classify the barcodes based on their presence in CTC and metastasis. 
+use_data <- bc_freq %>% 
+  filter(!is.na(n_spots)) %>% 
+  filter(n_spots >= 50)
+i_levels <- c('ctc_single', 'ctc_cluster', 'cto', 'metastasis')
+i <- i_levels[1]
+bc_list_top10 <- foreach(i=i_levels) %do% {
+  cpm_var <- paste0(i, '.cpm_total')
+  freq_var <- paste0(i, '.freq')
+  use_data %>% filter(.data[[freq_var]] > 0 )%>% arrange(desc(.data[[cpm_var]])) %>% pull('bc') %>% head(10)
+}
+bc_list_top10 <- bc_list_top10 %>% unlist %>% unique
+
+# Classify barcodes based on the presence in CTC and metastasis. We classify barcodes as specific to spatial transcriptomics if they are not detected in any of the CTC or metastasis sample type groups. detected means that freq is 0 across samples, with a threshold of 1000 CPM. 
+bc_freq %<>% 
+  mutate(
+    st_specific = ctc_single.freq == 0 & ctc_cluster.freq == 0 & cto.freq == 0 & metastasis.freq == 0 & n_spots >= 1000,
+    ctc_met_top10 = bc %in% bc_list_top10
+  )
+
+saveRDS(bc_freq, file.path(params$output_dir, 'seurat/bc_freq.rds'))
+```
+
+```{r dw-bc-ctc-spot-freq-combined-load}
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+```
+
+
+### Define hotspots for barcodes
+
+Define hotspots for each barcode using an adapted version of  [semla::DisconnectRegions](https://ludvigla.github.io/semla/articles/radial_distances.html#disconnect-regions) to detect singleton spots. We use only barcodes detected in at least 50 spots with at least 2 counts in the spatial data, which corresponds to a frequency of 0.25. At this level, we allow each spot to have multiple barcodes.
+
+First we define hotspots for (1) individual barcodes present in at least 50 spots (threshold ≥ 2 UMI counts), (2) for the combination of barcodes specific to spatial transcriptomics, and (3) finally for the combination of barcodes present in the top 10 of CTC and metastasis sample type groups and detected in at least 50 spots. We use the same approach for all three cases, but we use different sets of barcodes and different thresholds for the number of spots where the barcode is detected. We also use a higher threshold for the number of spots where the barcode is detected for the combination of barcodes specific to spatial transcriptomics, which is 200 spots, because we want to define a set of barcodes with high frequency in ST but not in CTC. 
+
+Then, we will keep only hotspots with ≥10 spots, and will create a Seurat object with the hotspots defined for each group (CTC and ST), and we will use this object to calculate the distance of each hotspot to CAFs, and to perform differential expression analysis between hotspots that are close to CAFs and those that are far from CAFs. We will also use this object to perform gene set enrichment analysis for the hotspots that are close to CAFs and those that are far from CAFs.
+
+```{r dw-define-bc-hotspots, eval = FALSE}
+dist_scaling_factor <- 1.3
+
+# Get Staffli object
+spatial_data <- GetStaffli(seu)
+
+# Extract coordinates, transformed after image alignment
+use_coords <- spatial_data@meta_data %>% 
+  # we don't use transformed coordinat
+  dplyr::rename(x = pxl_col_in_fullres, y = pxl_row_in_fullres) %>% 
+  dplyr::select(barcode, x, y, sampleID) %>% 
+  as_tibble()
+
+# Establish max distance for DisconnectRegions. 
+# DisconnectRegions call GetSpatialNetwork to create spatial networks from spatial coordinates.
+# Default option maxDist (distance cut-off for nearest neighbors to consider) from GetSpatialNetwork is  estimated from the data by taking the minimum neighbor distance multiplied by a factor of 1.2. This results in individual regions that in the spatial plot are connected. We need to reduce this cut-off by obtaining the minimum distance and multiplying by an higher factor. 
+# spatnet <- GetSpatialNetwork(use_coords)
+# min_distance <- foreach(i = spatnet) %do% {
+#   min(i$distance)
+# } %>% unlist %>% min
+# use_max_distance <- min_distance * 1.2
+
+# Load barcode matrix
+bc_mat <- readRDS(file.path(params$seurat_dir, "seurat_bc", "bc_matrix.rds"))
+
+# Initalize list with results
+hotspot_bc <- list()
+
+# Define hotposts for barcodes present in at least 50 spots with at least 4 reads. We use the DisconnectRegions function to define hotspots for each barcode. This function takes as input the spatial coordinates of the spots, the spots where the barcode is detected, and the maximum distance for defining hotspots. The output is a data.frame with the hotspot labels for each spot and barcode. We then merge the data.frames for each barcode into a single data.frame with the hotspot labels for each spot and barcode. We also add a column with the barcode ID for each row.
+
+use_bc <- bc_freq %>% 
+  filter(n_spots >= 50) %>% 
+  pull(bc)
+use_bc_id <- 'bc14-1018.bc30-1021989'
+res <- foreach(use_bc_id = use_bc, .combine = rbind) %do% {
+  use_spots <- bc_mat[use_bc_id,] %>% 
+    data.frame %>% 
+    filter(. >= 4) %>% 
+    rownames()
+  use_spots <- intersect(use_spots, use_coords$barcode)
+  disconnected_spot_labels <- DisconnectRegions(
+    use_coords, 
+    use_spots, 
+    # I keep maxDist as NULL : "Default option maxDist (distance cut-off for nearest neighbors to consider) from GetSpatialNetwork is  estimated for each slide, by taking the minimum neighbor distance multiplied by a factor of 1.2."
+    # maxDist = use_max_distance,
+  coords = 'array',
+    verbose = FALSE)
+  
+  disconnected_spot_labels %>% 
+    data.frame(check.names = FALSE) %>% 
+    set_names('hotspot') %>% 
+    rownames_to_column('sample_spot') %>% 
+    mutate(
+      hotspot = paste(use_bc_id, hotspot, sep = "_"),
+      bc = use_bc_id
+      )
+}
+hotspot_bc[['indv']] <- res %>% 
+  left_join(res %>% group_by(hotspot) %>% summarise(hotspot_size = n()),
+            by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(grepl('singleton', hotspot), 1, hotspot_size))
+
+# Define spots for CTC and ST, being both mutually exclusive. 
+use_bc <- bc_freq %>% filter(ctc_met_top10) %>% pull(bc)
+ctc_spots_hc <- colSums(bc_mat[use_bc,]) %>% 
+  data.frame %>% 
+  filter(. >= 4) %>% 
+  rownames()
+use_bc <- bc_freq %>% filter(st_specific) %>% pull(bc)
+st_spots_hc <- colSums(bc_mat[use_bc,]) %>% 
+  data.frame %>% 
+  filter(. >= 4) %>% 
+  rownames()
+
+use_bc <- bc_freq %>% filter(ctc_met_top10) %>% pull(bc)
+ctc_spots_lc <- colSums(bc_mat[use_bc,]) %>% 
+  data.frame %>% 
+  filter(. >= 1) %>% 
+  rownames()
+use_bc <- bc_freq %>% filter(st_specific) %>% pull(bc)
+st_spots_lc <- colSums(bc_mat[use_bc,]) %>% 
+  data.frame %>% 
+  filter(. >= 1) %>% 
+  rownames()
+
+ctc_spots <- setdiff(ctc_spots_hc, st_spots_lc)
+st_spots <- setdiff(st_spots_hc, ctc_spots_lc)
+length(ctc_spots)
+length(st_spots)
+
+# Define hotspots for the combination of barcodes present in the top 10 of CTC and metastasis sample type groups and detected in at least 50 spots. Here we are not defining hotspots based on indvidual barcodes, but the combination of all barcodes defined as present in the top 10 of CTC and metastasis sample type groups and detected in at least 50 spots. We use the same approach as before, but we only use the barcodes that are present in the top 10 of CTC and metastasis sample type groups and detected in at least 50 spots, which means that they are not specific to spatial transcriptomics, but they are also detected in CTC and metastasis samples.
+use_spots <- ctc_spots
+use_spots <- intersect(use_spots, use_coords$barcode)
+# disconnected_spot_labels <- DisconnectRegions(
+#   use_coords, 
+#   use_spots, 
+#   # maxDist = use_max_distance,
+#   coords = 'array',
+#   verbose = FALSE)
+#   
+# disconnected_spot_labels %<>% 
+#   data.frame(check.names = FALSE) %>% 
+#   set_names('hotspot') %>% 
+#   rownames_to_column('sample_spot')
+
+disconnected_spot_labels <- DisconnectRegions.sample(use_coords, use_spots, scaling_factor = dist_scaling_factor, verbose = FALSE)
+disconnected_spot_labels %>% group_by(hotspot) %>% summarise(hotspot_size = n())
+
+hotspot_bc[['ctc_top']] <- disconnected_spot_labels %>% 
+  left_join(disconnected_spot_labels %>% group_by(hotspot) %>% summarise(hotspot_size = n()),
+            by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(hotspot == 'singleton', 1, hotspot_size))
+
+# Define hotspots for the combination of barcodes specific to spatial transcriptomics present in at least 1000 spots. Here we are not defining hotspots based on indvidual barcodes, but the combination of all barcodes defined as specific to ST. We use the same approach as before, but we only use the barcodes that are specific to spatial transcriptomics, which means that they are not detected in any of the CTC or metastasis sample type groups (freq using CPM≥1000). We also use a higher threshold for the number of spots where the barcode is detected, which is 1000 spots. This is because we want to define hotspots for barcodes that are more confidently detected in the spatial data. We also allow each spot to have multiple barcodes, so we do not filter the spots based on the number of barcodes detected in them.i
+use_spots <- st_spots
+use_spots <- intersect(use_spots, use_coords$barcode)
+# remove spots with barcodes in the ctc_top list
+use_spots <- use_spots[!use_spots %in% hotspot_bc[['ctc_top']]$sample_spot]
+# disconnected_spot_labels <- DisconnectRegions(
+#   use_coords, 
+#   use_spots, 
+#   # maxDist = use_max_distance,
+#   coords = 'array',
+#   verbose = FALSE)
+#   
+# disconnected_spot_labels %<>% 
+#   data.frame(check.names = FALSE) %>% 
+#   set_names('hotspot') %>% 
+#   rownames_to_column('sample_spot')
+disconnected_spot_labels <- DisconnectRegions.sample(use_coords, use_spots, scaling_factor = dist_scaling_factor, verbose = FALSE)
+hotspot_bc[['st_specific']] <- disconnected_spot_labels %>% 
+  left_join(disconnected_spot_labels %>% group_by(hotspot) %>% summarise(hotspot_size = n()),
+            by = 'hotspot') %>% 
+  mutate(hotspot_size = ifelse(hotspot == 'singleton', 1, hotspot_size))
+
+
+
+# Save final hotspot definition
+saveRDS(hotspot_bc, file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+
+hotspot_bc$ctc_top %>% filter(hotspot != 'singleton') %>% nrow()
+hotspot_bc$st_specific %>% filter(hotspot != 'singleton') %>% nrow()
+
+hotspot_bc$ctc_top %>% filter(hotspot_size >= 5) %>% nrow()
+hotspot_bc$st_specific %>% filter(hotspot_size >= 5) %>% nrow()
+
+
+```
+
+Create a Seurat object with CTC hotspots and ST hotspots raw data and re-process
+```{r dw-bc-hotspots-to-seurat, eval = FALSE}
+hotspot_bc <- readRDS(file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+
+# Select hotspots with at least 3 spots, to be more confident in the hotspots defined. 
+st_spots <- hotspot_bc$st_specific %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+ctc_spots <- hotspot_bc$ctc_top %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+
+length(st_spots)
+length(ctc_spots)
+
+# Annotate Seurat object metadata
+use_seu <- seu
+use_seu[[]] %<>% 
+  rownames_to_column('sample_spot') %>%
+  mutate(
+    bc_group = ifelse(sample_spot %in% st_spots, 'ST', ifelse(sample_spot %in% ctc_spots, 'CTC', 'other'))
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+# Subset Seurat object and process
+use_seu <- subset(use_seu, cells = unique(c(st_spots, ctc_spots)))
+
+# SCTransform. We need to remove previous SCT slot, otherwise PrepSCTFindMarkers will complain. SCT re-identifies variable features
+DefaultAssay(use_seu) <- "Spatial"
+use_seu[["SCT"]] <- NULL
+
+options(future.globals.maxSize= 1500*1024^2)
+use_seu <- SCTransform(use_seu, verbose = TRUE, assay = "Spatial", min_cells = 2)
+
+# VariableFeatures update
+use_seu <- FindSpatiallyVariableFeatures(
+  use_seu, 
+  assay = "SCT", 
+  features = VariableFeatures(use_seu),
+  selection.method = "moransi",
+  slot = "data")
+
+
+
+# Temporary save
+# use_seu_copy <- use_seu
+# use_seu <- use_seu_copy
+
+# Find Neighbors using the Integrated Reduction
+# This uses the 30 PCs that account for the most variance across samples
+use_seu <- FindNeighbors(
+  use_seu, 
+  reduction = "integrated.dr", 
+  dims = 1:30,
+  graph.name = "integrated_graph",
+  k.param = 30
+)
+
+# Run UMAP using the same Reduction and Dimensions
+# This ensures the 2D layout matches the neighbor graph
+use_seu <- RunUMAP(
+  use_seu, 
+  reduction = "integrated.dr", 
+  dims = 1:30,
+  reduction.name = "umap",
+  umap.method = "uwot" 
+)
+
+# Find Clusters
+use_seu <- FindClusters(
+  use_seu, 
+  graph.name = "integrated_graph", 
+  cluster.name = "clusters.dr",
+  resolution = 0.40
+)
+table(use_seu$clusters.dr)
+
+
+# {
+# for (i in seq(0.30, 1, by = 0.10)) {
+#   use_seu <- FindClusters(
+#     use_seu, 
+#     graph.name = "integrated_graph", 
+#     cluster.name = "clusters.test",
+#     resolution = i,
+#     verbose = FALSE
+#   )
+#   
+#   x <- use_seu[[]] %>% 
+#     group_by(bc_group, clusters.test) %>% 
+#     summarise(n = n()) %>% 
+#     pivot_wider(id_cols = clusters.test, names_from = bc_group, 
+#                 values_from = n, values_fill = 0) %>% 
+#     mutate(
+#       CTC_prop = CTC / (CTC + ST),
+#       ST_prop = ST / (CTC + ST)
+#     ) 
+#   n_ctc <- x %>% filter(CTC_prop > 0.90) %>% 
+#     nrow
+#     n_st <- x %>% filter(ST_prop > 0.90) %>% 
+#     nrow
+#   cat(paste0("Resolution: ", i, " - Clusters with >90% CTC: ", n_ctc, "\n"))
+#   cat(paste0("Resolution: ", i, " - ST with >90% CTC: ", n_st, "\n"))
+#   
+# }
+# 
+# }
+
+# Build Cluster Tree using the REDUCTION
+# CRITICAL: We use the reduction here so the tree 'sees' the same 
+# distances that the UMAP and Neighbors saw.
+# Check phylogenetic tree of clusters (pseudobulk and similarity) and Reorder them according to their similarity (re-name each cluster based on the position on the phylogenetic tree). We need to use the same reduction and dims that we used for FindNeighbors. The renamed clusters will be stored in Idents()
+use_seu <- BuildClusterTree(
+  use_seu, 
+  reduction = "integrated.dr", 
+  dims = 1:30,
+  reorder = TRUE
+)
+# # table(Idents(use_seu), use_seu$clusters.dr)
+use_seu$clusters <- Idents(use_seu)
+
+# PlotClusterTree(use_seu)
+# p2 <- DimPlot(use_seu, reduction = "umap", group.by = "bc_group", alpha = 0.5)
+# p4 <- DimPlot(use_seu, reduction = "umap", group.by = "clusters", alpha = 0.5, label = TRUE)
+# p3 <- DimPlot(use_seu, reduction = "umap", group.by = "sample_alias", alpha = 0.5)
+# p5 <- FeaturePlot(use_seu, features = c('VIM'))
+# p6 <- FeaturePlot(use_seu, features = c('MKI67'))
+# p2 + p4 + p5 + p6
+# # 
+# use_seu[[]] %>%
+#   ggplot(aes(clusters.dr, fill = bc_group)) +
+#   geom_bar(position = 'fill') +
+#   scale_fill_manual(values = bc_group_palette)
+
+
+# Run PrepSCTFindMarkers to prepare the Seurat object for differential expression analysis. This function calculates the average expression and percentage of cells expressing each gene in each cluster, which are used as input for the FindMarkers function. We need to run this function before running FindMarkers, because we have re-processed the Seurat object and we need to update the average expression and percentage of cells expressing each gene in each cluster.
+# I am having difficulties to run PrepSCTFindMarkers on use_seu, need some preprocessing first. I don't know if it is the effect of merged visium data or semla preprocessing. 
+# SCTResults(object=use_seu, slot="umi.assay") # Notice that one of your layers has "Spatial" while the others have "RNA" listed
+# Force "Spatial" into each dataslot:
+for(i in names(use_seu@assays$SCT@SCTModel.list)) {
+  slot(object = use_seu@assays$SCT@SCTModel.list[[i]], name="umi.assay") <- "Spatial"
+}
+use_seu <- PrepSCTFindMarkers(use_seu, assay = "SCT") 
+
+
+# We group bc_group into subtypes based on clustering and spatial distribution. 
+bc_group_cluster_stats <- use_seu[[]] %>% 
+  group_by(bc_group, clusters) %>% 
+  summarise(n = n()) %>% 
+  pivot_wider(id_cols = clusters, names_from = bc_group, 
+              values_from = n, values_fill = 0) %>% 
+  mutate(
+    CTC_prop = CTC / (CTC + ST),
+    ST_prop = ST / (CTC + ST)
+  )
+bc_group_cluster_stats$CTC_iprop <- bc_group_cluster_stats$CTC/sum(bc_group_cluster_stats$CTC)
+bc_group_cluster_stats$ST_iprop <- bc_group_cluster_stats$ST/sum(bc_group_cluster_stats$ST)
+
+
+# bc_group_cluster_stats %>% arrange(desc(CTC_prop))
+st_clusters <- bc_group_cluster_stats %>% filter(ST_prop > 0.65) %>% pull(clusters) %>% as.character
+mixed_clusters <- bc_group_cluster_stats %>% filter(CTC_prop < 0.65 & ST_prop < 0.65) %>% pull(clusters) %>% as.character
+
+use_seu[[]] %<>% 
+  mutate(
+    bc_group_cluster = ifelse(bc_group == 'CTC' & 
+                                clusters %in% c("0", "6", "7"),
+                              'CTC1',
+                              NA),
+    bc_group_cluster = ifelse(bc_group == 'CTC' & 
+                                clusters %in% c("1", "3", "2"),
+                              'CTC2',
+                              bc_group_cluster),
+    
+    bc_group_cluster = ifelse(bc_group == 'ST' & 
+                                clusters %in% c("4", "5"),
+                              'ST',
+                              bc_group_cluster),
+    bc_group_cluster = factor(bc_group_cluster, levels = c('ST', 'CTC1', 'CTC2'))
+  )
+
+# Save final Seurat object
+saveRDS(use_seu, file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+
+
+```
+
+
+### Analysis of barcode hotspots 
+
+Barcode groups proximity: Calculate 3D radial distances to CAF hotspots using transformed coordinates and merged slides
+```{r bc_groups-distance-3d-trans, eval = FALSE}
+use_seu <- seu
+
+# Load BC groups annotation
+seu_bc <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+add_annot <- seu_bc[[]] %>% 
+  rownames_to_column('barcode') %>% 
+  select(barcode, bc_group_cluster)
+
+# Add annotation hotspots to seurat/semla object
+use_seu[[]] %<>% 
+  rownames_to_column('barcode') %>% 
+  left_join(add_annot, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+#   RadialDistance calls ExtractRegionNeighbors to get the neighboring spots for each spot in the selected group. So, we need to apply the same criteria that we used to define hotspots, by setting the minimum spot distance by sample and a scaling factor of 1.3. To do so, we will need to run RadialDistance by sample. To run it by sample we cannot use the RadialDistance.Seurat, we need to use the RadialDisance.default method.
+# Original coordiantes are in pixels, while z-coordinates are in microns. We need to transform z to pixels. To do so, wee need to know how many pixels represent 100microns gap (center to center), or 55microns, which is the size of the spots. We need to do it by sample, by geting the minimum distance for each sampleusing the `semla::GetSpatialNetwork` function with a large distance threshold and then taking the median of the distances between spots. The, we will use the average to transform Z coordinates from microns to pixels, and then we will run RadialDistance.3D with the transformed coordinates and the z-coordinates in pixels.
+
+physical_spot_um <- 55
+slide_info <- read_csv(file.path(params$seurat_dir, 'slide_info.csv'),
+                       show_col_types = FALSE)
+
+# Change default coordiantes from Staffli object from raw to transformed
+use_seu@tools$Staffli@meta_data %<>% 
+  mutate(
+    pxl_col_in_fullres_raw = pxl_col_in_fullres,
+    pxl_row_in_fullres_raw = pxl_row_in_fullres,
+    pxl_col_in_fullres = pxl_col_in_fullres_transformed,
+    pxl_row_in_fullres = pxl_row_in_fullres_transformed
+  )
+
+# Convert Z coordiantes to pixels
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+use_seu@meta.data %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(do.call(rbind, use_coords_list) %>% select(-sampleID) ) %>% 
+  mutate(
+    z = z_um / um_per_pxl
+  ) %>% 
+  column_to_rownames('barcode')
+
+# Extract min distance for maxDist parameter
+min_distance_pxl <- foreach(i = spatnet_list) %do% {
+  i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance)
+} %>% unlist %>% mean
+
+# Chang
+use_seu$barcode <- colnames(use_seu)
+
+ct <- levels(use_seu$bc_group_cluster)[1]
+ct <- "ST"
+for(ct in levels(use_seu$bc_group_cluster)) {
+
+  use_seu <- RadialDistance3D.Seurat(
+    use_seu,
+    column_name = "bc_group_cluster",
+    selected_groups = ct, 
+    maxDist = min_distance_pxl*3,
+    convert_to_microns = TRUE,
+    remove_singletons = TRUE
+  )
+}
+
+# Prepare dataset with distance matrix information
+dist_var <- paste0("r_dist_", levels(use_seu$bc_group_cluster))
+res <- use_seu[[]] %>% 
+  select(barcode, all_of(dist_var))
+saveRDS(res, file.path(params$output_dir, 'seurat_hs', 'bc_group_cluster_r_dist.rds'))
+```
+
+Find markers of specific comparisons
+```{r dw-findmarkers-comparisons, eval = FALSE}
+use_seu <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+chunk_suffix <- 'comp'
+use_comparisons <- combn(rev(levels(use_seu$bc_group_cluster)), 2, simplify = FALSE)
+
+# All pairwise comparisons
+res_markers <- foreach(i = use_comparisons) %do% {
+  spots_sample <- colnames(use_seu)[use_seu$bc_group_cluster == i[1] & !is.na(use_seu$bc_group_cluster)]
+  spots_ref <- colnames(use_seu)[use_seu$bc_group_cluster == i[2] & !is.na(use_seu$bc_group_cluster)]
+  
+  de_markers <- FindMarkers(use_seu, 
+                            ident.1 = spots_sample,
+                            ident.2 = spots_ref,
+                            logfc.threshold = 0.2,
+                            min.pct = 0.01,
+                            test.use = "wilcox")
+  list(
+    result = de_markers %>% rownames_to_column('gene'),
+    ident.1 = spots_sample,
+    ident.2 = spots_ref,
+    ident.1.name = i[1],
+    ident.2.name = i[2]
+  )
+}
+names(res_markers) <- foreach(i = use_comparisons) %do% {
+  paste0(i[1], '-over-', i[2])
+} %>% unlist
+
+# 
+# 
+# # Differential expression: CTC1 close to CAF (<50) vs CTC1 far from CAF (>100)
+# spots_sample <- use_seu[[]] %>% 
+#   filter(bc_group_cluster == 'CTC1' & !is.na(use_seu$bc_group_cluster)) %>% 
+#   filter(r_dist_caf_hotspot_3d_transformed <= 50) %>% 
+#   rownames
+# spots_ref <- use_seu[[]] %>% 
+#   filter(bc_group_cluster == 'CTC1' & !is.na(use_seu$bc_group_cluster)) %>% 
+#   filter(r_dist_caf_hotspot_3d_transformed > 100) %>% 
+#   rownames
+# 
+# de_markers <- FindMarkers(use_seu, 
+#                           ident.1 = spots_sample,
+#                           ident.2 = spots_ref,
+#                           logfc.threshold = 0.2,
+#                           min.pct = 0.01,
+#                           test.use = "wilcox")
+# res_markers$`CTC1 - CAF proximity` <- list(
+#   result = de_markers %>% rownames_to_column('gene'),
+#   ident.1 = spots_sample,
+#   ident.2 = spots_ref,
+#   ident.1.name = 'CTC1 - close to CAF',
+#   ident.2.name = 'CTC1 - far from CAF'
+# )
+
+saveRDS(res_markers, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+```
+
+Find markers for barcode groups
+```{r dw-findmarkers-bc_group_cluster, eval = FALSE}
+use_seu <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+chunk_suffix <- 'bc_group_cluster'
+res_markers <- list()
+
+res_markers <- foreach(i = levels(use_seu$bc_group_cluster)) %do% {
+  spots_sample <- colnames(use_seu)[use_seu$bc_group_cluster == i & !is.na(use_seu$bc_group_cluster)]
+  
+  de_markers <- FindMarkers(use_seu, 
+                            ident.1 = spots_sample,
+                            logfc.threshold = 0.2,
+                            min.pct = 0.01,
+                            test.use = "wilcox")
+  list(
+    result = de_markers %>% rownames_to_column('gene'),
+    ident.1 = spots_sample,
+    ident.1.name = i,
+    ident.2.name = 'Other'
+  )
+}
+
+names(res_markers) <- levels(use_seu$bc_group_cluster)
+
+saveRDS(res_markers, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+
+```
+
+Find markers by cluster
+```{r dw-findmarkers-clusters, eval = FALSE}
+use_seu <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+chunk_suffix <- 'cluster'
+res_markers <- list()
+
+use_cl <- table(use_seu$clusters) %>% data.frame %>% filter(Freq > 50) %>% pull(Var1)
+res_markers <- foreach(i = use_cl) %do% {
+  spots_sample <- colnames(use_seu)[use_seu$clusters == i]
+  
+  de_markers <- FindMarkers(use_seu, 
+                            ident.1 = spots_sample,
+                            logfc.threshold = 0.2,
+                            min.pct = 0.01,
+                            test.use = "wilcox")
+  list(
+    result = de_markers %>% rownames_to_column('gene'),
+    ident.1 = spots_sample,
+    ident.1.name = i,
+    ident.2.name = 'Other'
+  )
+}
+names(res_markers) <- use_cl
+
+
+saveRDS(res_markers, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+
+```
+
+Perform functional enrichment for specific comparisons
+```{r dw-findmarkers-gse_omnibus-comparisons, eval = FALSE}
+chunk_suffix <- 'comp'
+res_markers <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+# Run functional enrichment
+library(org.Hs.eg.db)
+
+dge_i <-  res_markers[[2]]
+
+gse_list <- foreach(dge_i = res_markers) %do%{
+  dge <- dge_i$result
+  gse_res <- gse_omnibus(
+    feature_names = dge$gene,
+    p = dge$p_val_adj,
+    fc = dge$avg_log2FC,
+    fc_thrs = 0,
+    gmt_files = gmt_files_symbols,
+
+    run_enricher = TRUE,
+    run_enrichGO = FALSE,
+    run_enrichReactome = FALSE,
+
+    run_GSEA = TRUE,
+    run_gseGO = FALSE,
+    run_gseReactome = FALSE,
+    
+    go_ontologies = c('BP', 'MF'),
+    go_simplify_p = 0.05,
+    go_simplify_cutoff = 0.7,
+    
+    args_enricher = list(qvalueCutoff = 1, 
+                         minGSSize = 10, 
+                         maxGSSize = 250, 
+                         pvalueCutoff = 1),
+    
+    args_gse = list(minGSSize = 10, 
+                    maxGSSize = 250, 
+                    pvalueCutoff = 1, 
+                    BPPARAM = BiocParallel::MulticoreParam(params$ncores)
+    )
+  )
+  
+  return(gse_res)
+  
+}
+names(gse_list) <- names(res_markers)
+
+saveRDS(gse_list, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+```
+
+Perform functional enrichment by barcode groups
+```{r dw-findmarkers-gse_omnibus-bc_group_cluster, eval = FALSE}
+chunk_suffix <- 'bc_group_cluster'
+res_markers <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+# Run functional enrichment
+library(org.Hs.eg.db)
+
+dge_i <-  res_markers[[2]]
+
+gse_list <- foreach(dge_i = res_markers) %do%{
+  dge <- dge_i$result
+  gse_res <- gse_omnibus(
+    feature_names = dge$gene,
+    p = dge$p_val_adj,
+    fc = dge$avg_log2FC,
+    fc_thrs = 0,
+    gmt_files = gmt_files_symbols,
+
+    run_enricher = TRUE,
+    run_enrichGO = FALSE,
+    run_enrichReactome = FALSE,
+
+    run_GSEA = TRUE,
+    run_gseGO = FALSE,
+    run_gseReactome = FALSE,
+    
+    go_ontologies = c('BP', 'MF'),
+    go_simplify_p = 0.05,
+    go_simplify_cutoff = 0.7,
+    
+    args_enricher = list(qvalueCutoff = 1, 
+                         minGSSize = 10, 
+                         maxGSSize = 250, 
+                         pvalueCutoff = 1),
+    
+    args_gse = list(minGSSize = 10, 
+                    maxGSSize = 250, 
+                    pvalueCutoff = 1, 
+                    BPPARAM = BiocParallel::MulticoreParam(params$ncores)
+    )
+  )
+  
+  return(gse_res)
+  
+}
+names(gse_list) <- names(res_markers)
+
+saveRDS(gse_list, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+```
+
+Perform functional enrichment by cluster
+```{r dw-findmarkers-gse_omnibus-clusters, eval = FALSE}
+chunk_suffix <- 'cluster'
+res_markers <- readRDS(file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_', chunk_suffix,'.rds')))
+# Run functional enrichment
+library(org.Hs.eg.db)
+
+dge_i <-  res_markers[[2]]
+
+gse_list <- foreach(dge_i = res_markers) %do%{
+  dge <- dge_i$result
+  gse_res <- gse_omnibus(
+    feature_names = dge$gene,
+    p = dge$p_val_adj,
+    fc = dge$avg_log2FC,
+    fc_thrs = 0,
+    gmt_files = gmt_files_symbols,
+
+    run_enricher = TRUE,
+    run_enrichGO = FALSE,
+    run_enrichReactome = FALSE,
+
+    run_GSEA = TRUE,
+    run_gseGO = FALSE,
+    run_gseReactome = FALSE,
+    
+    go_ontologies = c('BP', 'MF'),
+    go_simplify_p = 0.05,
+    go_simplify_cutoff = 0.7,
+    
+    args_enricher = list(qvalueCutoff = 1, 
+                         minGSSize = 10, 
+                         maxGSSize = 250, 
+                         pvalueCutoff = 1),
+    
+    args_gse = list(minGSSize = 10, 
+                    maxGSSize = 250, 
+                    pvalueCutoff = 1, 
+                    BPPARAM = BiocParallel::MulticoreParam(params$ncores)
+    )
+  )
+  
+  return(gse_res)
+  
+}
+names(gse_list) <- names(res_markers)
+
+saveRDS(gse_list, file.path(params$output_dir, 'seurat_hs', paste0('results_findMarkers_gse_', chunk_suffix,'.rds')))
+```
+
+
+### Load final data
+```{r dw-load-processed-data}
+bc_mat <- readRDS(file.path(params$seurat_dir, "seurat_bc", "bc_matrix.rds"))
+bc_freq <- readRDS(file.path(params$output_dir, 'seurat/bc_freq.rds'))
+seu_full_list <- readRDS(file.path(params$seurat_dir, "seurat", 'seurat_merged_list.rds'))
+seu_bc <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+
+# Load hotspot data
+hotspot_bc <- readRDS(file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+caf_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_caf_hotspot_2.rds")) 
+lyve1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_lyve1_hotspot_1.rds"))
+pecam1_hotspots <- readRDS(file.path(params$output_dir, "hotspots_tme", "spots_pecam1_hotspot_1.rds")) 
+```
+
+Add annotation to Seurat object
+```{r dw-add-annotation-seurat}
+# Add CAF spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- caf_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$caf_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add Lyve1 spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- lyve1_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$lyve1_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add Pecam1 spots: Filtering criteria must follow the same approach as in chunk::caf-distance-conf
+use_bc <- pecam1_hotspots %>%
+  filter(hotspot != 'singleton') %>%
+  filter(hotspot_size >= 3) %>%
+  pull(sample_spot)
+
+seu$pecam1_hotspots <- ifelse(colnames(seu) %in% use_bc, 'yes', NA)
+
+# Add hotspots defined based on barcodes. We use the same criteria as in chunk::dw-bc-hotspots-to-seurat
+st_spots <- hotspot_bc$st_specific %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+ctc_spots <- hotspot_bc$ctc_top %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+
+seu[[]] %<>% 
+  rownames_to_column('sample_spot') %>%
+  mutate(
+    bc_group = ifelse(sample_spot %in% st_spots, 'ST', ifelse(sample_spot %in% ctc_spots, 'CTC', 'other'))
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+```
+
+Create a Seurat object combining CAF hotspots and BC group annotation. We will use this Seurat object for the spatial distribution analysis.
+```{r dw-seurat-bc-caf}
+# Seurat object combining CAF and BC group annotation
+seu_bc_caf <- seu
+
+# Add bc_group_cluster information
+bc_group_cluster_spots <- seu_bc[[]] %>% rownames_to_column('sample_spot') %>% 
+  select(sample_spot, bc_group_cluster, clusters)
+
+# Add Acta2 expression
+# Rename groups
+seu_bc_caf[[]] %<>% 
+  rownames_to_column('sample_spot') %>% 
+  left_join(bc_group_cluster_spots) %>% 
+  mutate(
+    group_hotspots = paste(bc_group, caf_hotspots, sep = '_'),
+    group_hotspots = gsub("_NA", "", group_hotspots),
+    group_hotspots = gsub("NA_", "", group_hotspots),
+    group_hotspots = gsub("yes", "CAF", group_hotspots),
+    group_hotspots = gsub("other_CAF", "CAF", group_hotspots),
+    
+    group_hotspots_extended = paste(bc_group_cluster, caf_hotspots, sep = '_'),
+    group_hotspots_extended = gsub("_NA", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("NA_", "", group_hotspots_extended),
+    group_hotspots_extended = gsub("yes", "CAF", group_hotspots_extended),
+    group_hotspots_extended = ifelse(group_hotspots_extended == 'NA', 'other', group_hotspots_extended)
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+# Remove spots with no annotation
+seu_bc_caf_full <- seu_bc_caf
+seu_bc_caf <- seu_bc_caf[,seu_bc_caf$group_hotspots !='other']
+```
+

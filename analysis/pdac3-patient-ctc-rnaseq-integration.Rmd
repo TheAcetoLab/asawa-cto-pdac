@@ -1,0 +1,1515 @@
+---
+title: "Analysis of PDAC-3 and patients"
+subtitle: "Intersection of GSEA results across models for sample type"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  gse_file_regex_xenograft: ./output/rnaseq/DONOR/differential_expression_edger/sample_type/gse_omnibus-edgeR_QLF.rds
+  model_xenograft: pdac3-ctc
+  gse_file_regex_patient: ./output/rnaseq/DONOR/differential_expression_edger/donor_batch/sample_type/gse_omnibus-edgeR_QLF.rds
+  model_patient: patients-ctc
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(knitr)
+library(kableExtra)
+library(magrittr)
+library(patchwork)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data wrangling
+
+Load gse_omnibus files
+```{r conf-gse-files}
+# Load xengraft models
+list_models_x <- str_split(params$model_xenograft, ',', simplify = FALSE) %>% unlist
+gse_list_x <- foreach(model = list_models_x) %do% {
+  gse_file <- params$gse_file_regex_xenograft %>%
+    gsub('DONOR', model, .)
+  if(file.exists(gse_file)) {
+    readRDS(gse_file)
+  } else {
+    NULL
+  }
+}
+names(gse_list_x) <- list_models_x
+
+# Load patient models
+list_models_p <- str_split(params$model_patient, ',', simplify = FALSE) %>% unlist
+gse_list_p <- foreach(model = list_models_p) %do% {
+  gse_file <- params$gse_file_regex_patient %>%
+    gsub('DONOR', model, .)
+  if(file.exists(gse_file)) {
+    readRDS(gse_file)
+  } else {
+    NULL
+  }
+}
+names(gse_list_p) <- list_models_p
+
+gse_list <- c(gse_list_x, gse_list_p)
+list_models <- c(list_models_p, list_models_x)
+```
+
+Modify xenografts comparison names to be more intuitive
+```{r conf-gse-rename}
+# Xenografts
+use_comps <- c("CTO-over-S-mouse_id", "CTO-over-Cl-mouse_id")
+new_comps <- c("CTO-over-Single", "CTO-over-Cluster")
+for(i in c('pdac3-ctc')){
+  gse_list[[i]] <- gse_list[[i]][use_comps]
+  names(gse_list[[i]]) <- new_comps
+}
+
+# Patients
+use_comps <- c("CTO-over-S-donor", "CTO-over-Cl-donor")
+new_comps <- c("CTO-over-Single", "CTO-over-Cluster")
+for(i in c('patients-ctc')){
+  gse_list[[i]] <- gse_list[[i]][use_comps]
+  names(gse_list[[i]]) <- new_comps
+}
+```
+
+Get full list of comparisons done
+```{r conf-gse-comparisons}
+comp_list <- foreach(i = gse_list) %do% {
+  names(i)
+} %>% unlist %>% unique
+```
+
+Merge GSE files
+```{r conf-gse-merge}
+model <- names(gse_list)[1]
+comp <- comp_list[1]
+sr <- 'GSEA'
+gc <- 'msigdb.c2.cp'
+gse_list_merged <- foreach(comp = comp_list) %do% {
+  res <- foreach(model = list_models, .combine = rbind) %do% {
+    x <- gse_list[[model]][[comp]][[sr]][[gc]]
+    if(!is.null(x)) {
+      return(x@result %>% 
+        mutate(
+          model = model,
+          model = ifelse(model == 'patients-ctc', 'Patient', model),
+          model = ifelse(model == 'pdac3-ctc', 'PDAC-3', model),
+          model = factor(model, levels = c('PDAC-3', 'Patient'))
+          )
+      )
+    } else {
+      return(NULL)
+    }
+  }
+  return(res)
+}
+names(gse_list_merged) <- comp_list
+```
+
+Set group levels manually, for extended plots
+```{r conf-gse-groups-levels}
+group_levels <- list(
+  `CTO-over-Single` = c(
+    "Cell cycle",
+    "Translation",
+    "Metabolism",
+    "Cytoskeleton",
+    "Immune response",
+    "DNA replication",
+    "Cellular response to stress",
+    "RNA processing",
+    "OxPhos and ATP synthesis",
+    "MET signalling",
+    "ECM degradation",
+    "Interferron signalling",
+    "Cell-matrix interaction" 
+  ),
+  `CTO-over-Cluster` = c(
+    "Translation",
+    "DNA replication",
+    "Cell-cell junction",
+    "Cytoskeleton",
+    "Cell cycle",
+    "ECM organization",
+    "Met Pathway",
+    "Cell-matrix interactions",
+    "Metabolism",
+    "Immune response",
+    "Interferon signalling"
+  )
+)
+```
+
+
+Add groups to gene sets, generated manually
+```{r conf-gse-groups}
+# Get gene set grouping 
+gsets_grouping_file <- './data/external/pdac3_gsea_gsets_groups_20260408.xlsx' 
+gsets_sheets <- readxl::excel_sheets(path = gsets_grouping_file)
+gsets_groups <- foreach(i = gsets_sheets) %do% {
+  readxl::read_xlsx(gsets_grouping_file, sheet = i)
+}
+names(gsets_groups) <- gsets_sheets
+
+for(comp in names(gse_list_merged)) {
+  gse_list_merged[[comp]] %<>% left_join(gsets_groups[[comp]], by = 'ID') %>% 
+    filter(!is.na(Group)) %>% 
+    mutate(gene_set_group = factor(Group, levels = group_levels[[comp]]))
+}
+```
+
+
+
+Add group stats
+```{r conf-gse-group-stats}
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  gs_nsign <-  gse_list_merged[[comp]] %>% 
+    group_by(ID) %>%
+    summarise(
+      n_significant = sum(p.adjust < 0.05),
+      n_up = sum(NES > 0),
+      avg_fdr = mean(p.adjust),
+      avg_nes = mean(NES)
+    )
+  gse_list_merged[[comp]] %<>% left_join(gs_nsign, by = 'ID')
+}
+
+```
+
+
+## Dot plots by comparison (complete)
+
+```{r gse-dotplots, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+root_section_number <- 3
+section_n <- 1
+
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h3> <span class=\"header-section-number\">",h_section_number,"</span>", comp, "</h3>\n\n") #Cause results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes),
+      
+    )
+  if(nrow(x) == 0) {
+    cat("No gene sets significant in at least two models.\n\n")
+  } else {
+    xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+    res <- x %>% 
+      ggplot(aes(x = NES, y = Description, size = log10P, fill = NES)) +
+      geom_point(pch = 21, aes(color = is.sign)) +
+      facet_grid(cols = vars(model), rows = vars(gene_set_group), scales = 'free_y', space = 'free_y') +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      labs(
+        y = '',
+        size = expression(paste("lo", g[10],"(Adjusted P value)")),
+        color = 'FDR < 0.05'
+        # caption = 'Gene sets with FDR<0.05 in at least 2 models',
+      ) +
+      scale_size_continuous(range=c(0.8, 2)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      # scale_color_viridis_c() +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_text(angle = 0, hjust = 0),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+        axis.text.y = element_text(size = 4),
+        axis.text.x = element_text(size = 4),
+        
+        legend.text = element_text(size = 4), 
+        legend.title = element_text(size = 4),
+        legend.key.width = unit(0.2, "cm")
+      )
+    
+    n_gsets <- x$ID %>% unique() %>% length()
+    # use_width <-  7.2 + n_gsets * 0.02
+    use_width <- 5.1
+    # use_asp <-  0.318 + n_gsets * 0.017
+    use_asp <-  n_gsets * 0.021
+    use_height <- use_width * use_asp
+    subchunkify(res,
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot',
+                suffix = comp )
+    
+    
+    cat("\n\n")
+  }
+  
+}
+```
+
+## Dot plots by comparison (unnamed)
+
+```{r gse-dotplots-unnamed, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+root_section_number <- 4
+section_n <- 1
+
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h3> <span class=\"header-section-number\">",h_section_number,"</span>", comp, "</h3>\n\n") #Cause results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes)
+    )
+  if(nrow(x) == 0) {
+    cat("No gene sets significant in at least two models.\n\n")
+  } else {
+
+    # Remove redundancy
+    x %<>% 
+      group_by(model, gene_set_group, Description) %>% 
+      slice_min(avg_fdr, n = 1, with_ties = FALSE)
+    
+    xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+    
+    res <- x %>% 
+      ggplot(aes(x = NES, y = Description, size = log10P, fill = NES)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      # geom_point(pch = 21, aes(color = is.sign)) +
+      geom_point(data = x %>% filter(is.sign == 'yes'), pch = 21, aes(color = is.sign)) +
+      geom_point(data = x %>% filter(is.sign == 'no'), pch = 21, stroke = 0) +
+      facet_grid(cols = vars(model), rows = vars(gene_set_group), scales = 'free_y', space = 'free_y') +
+      labs(
+        x = '',
+        y = '',
+        size = expression(paste("lo", g[10],"(FDR)")),
+        color = 'FDR\n< 0.05'
+      ) +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      scale_size_continuous(range=c(0.5, 1.1)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank(),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        
+        legend.text = element_text(size = 3), 
+        legend.title = element_text(size = 3),
+        legend.key.width = unit(0.1, "cm"),
+        legend.key.height = unit(0.1, "cm"),
+        
+        plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches")
+      )
+          
+    n_gsets <- x$ID %>% unique() %>% length()
+    n_gsgroups <- x$gene_set_group %>% unique %>% length
+    
+
+    # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+    nmodels <- x$model %>% unique() %>% length()
+    # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+    use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+    
+    # Calculate height: top margin + tickmarks + bottom margin and legend
+    use_height <- 0.0217 + 0.0217 + n_gsets * 0.0492 + (0.035*(nmodels - 1)) + 0.4984
+
+
+    subchunkify(res +
+                  guides(
+                    size  = guide_legend(direction = "vertical",
+                                         keyheight = unit(0.0289, "inches"),
+                                         keywidth = unit(0.0289, "inches")
+                                         ),
+                    color = "none",
+                    fill  = "none"
+                    # color = guide_legend(direction = "vertical"),
+                    # fill  = guide_colourbar(direction = "vertical")
+                  ) +
+                  theme(
+                    legend.position = "bottom",
+                    legend.box = "horizontal"
+                  ),
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-sign-dotplot-unnamed',
+                suffix = comp )
+    
+    cat("\n\n")
+    
+    # Print legend
+    res_legend <- get_legend(
+      res +
+        guides(
+          color = guide_legend(direction = "vertical"),
+          size  = guide_legend(direction = "vertical"),
+          fill  = guide_colourbar(direction = "vertical")
+        ) +
+        theme(
+          legend.position = "bottom",
+          legend.box = "horizontal"
+        )
+    )
+    subchunkify(plot_grid(res_legend),
+                fig.width = 1.8,
+                fig.height = 1,
+                dpi = 600,
+                prefix = 'gse-sign-dotplot-legend-unnamed',
+                suffix = comp )
+
+    cat("\n\n")
+  }
+  
+}
+```
+
+
+## Dot plots by comparison (separate scale)
+
+```{r gse-dotplots-separate, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+root_section_number <- 3
+section_n <- 1
+
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h3> <span class=\"header-section-number\">",h_section_number,"</span>", comp, "</h3>\n\n") #Cause results='asis',we must use raw HTML
+  section_n <- section_n + 1
+
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes)
+    )
+  if(nrow(x) == 0) {
+    cat("No gene sets significant in at least two models.\n\n")
+  } else {
+    xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+    
+    x_pdac3 <-  x %>% 
+      filter(model == 'PDAC-3')
+    x_patient <-  x %>% 
+      filter(model == 'Patient')
+    
+    for(i in levels(x$Description)) {
+      if(!i %in% x_pdac3$Description ) {
+        x_pdac3 %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'PDAC-3',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+      if(!i %in% x_patient$Description ) {
+        x_patient %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'Patient',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+    }
+    
+    # Remove redundancy
+    x_pdac3 %<>% 
+      group_by(gene_set_group, Description) %>% 
+      slice_min(pvalue, n = 1, with_ties = FALSE)
+    x_patient %<>% 
+      group_by(gene_set_group, Description) %>% 
+      slice_min(pvalue, n = 1, with_ties = FALSE)
+    
+    # Refactor Description
+    x_pdac3 %<>% 
+      mutate(
+        Description = as.character(Description),
+        Description = factor(Description, levels = levels(x$Description))
+        )
+    x_patient %<>% 
+      mutate(
+        Description = as.character(Description),
+        Description = factor(Description, levels = levels(x$Description))
+        )      
+    
+    # Generate plots
+    res_1 <- x_pdac3 %>% 
+      ggplot(aes(x = NES, y = Description, size = log10P, fill = NES)) +
+      # geom_point(pch = 21, aes(color = is.sign)) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      facet_grid(cols = vars(model), rows = vars(gene_set_group), scales = 'free_y', space = 'free_y') +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      labs(
+        y = '',
+        size = expression(paste("lo", g[10],"(Adjusted P value)")),
+        color = 'FDR < 0.05'
+        # caption = 'Gene sets with FDR<0.05 in at least 2 models',
+      ) +
+      scale_size_continuous(range=c(0.8, 2)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      # scale_color_viridis_c() +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_text(angle = 0, hjust = 0),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+        axis.text.y = element_text(size = 4),
+        axis.text.x = element_text(size = 4),
+        
+        legend.text = element_text(size = 4), 
+        legend.title = element_text(size = 4),
+        legend.key.width = unit(0.2, "cm"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+    
+    res_2 <- x_patient %>% 
+      ggplot(aes(x = NES, y = Description, size = log10P, fill = NES)) +
+      # geom_point(pch = 21, aes(color = is.sign)) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      facet_grid(cols = vars(model), rows = vars(gene_set_group), scales = 'free_y', space = 'free_y') +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      labs(
+        y = '',
+        size = expression(paste("lo", g[10],"(Adjusted P value)")),
+        color = 'FDR < 0.05'
+        # caption = 'Gene sets with FDR<0.05 in at least 2 models',
+      ) +
+      scale_size_continuous(range=c(0.8, 2)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      # scale_color_viridis_c() +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_text(angle = 0, hjust = 0),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+        axis.text.y = element_text(size = 4),
+        axis.text.x = element_text(size = 4),
+        
+        legend.text = element_text(size = 4), 
+        legend.title = element_text(size = 4),
+        legend.key.width = unit(0.2, "cm"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+    
+    n_gsets <- x$ID %>% unique() %>% length()
+    # use_width <-  7.2 + n_gsets * 0.02
+    use_width <- 5.1
+    # use_asp <-  0.318 + n_gsets * 0.017
+    use_asp <-  n_gsets * 0.021
+    use_height <- use_width * use_asp
+
+    subchunkify(res_1,
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot-separate-pdac3',
+                suffix = comp )
+    cat("\n\n")
+    subchunkify(res_2,
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot-separate-patient',
+                suffix = comp )   
+    
+    cat("\n\n")
+  }
+  
+}
+```
+
+
+
+## Dot plots by comparison (unamed and separate scale)
+
+```{r gse-dotplots-unnamed-spearate, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+root_section_number <- 4
+section_n <- 1
+
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h3> <span class=\"header-section-number\">",h_section_number,"</span>", comp, "</h3>\n\n") #Cause results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes)
+    )
+  if(nrow(x) == 0) {
+    cat("No gene sets significant in at least two models.\n\n")
+  } else {
+
+    # Remove redundancy
+    x %<>% 
+      group_by(model, gene_set_group, Description) %>% 
+      slice_min(avg_fdr, n = 1, with_ties = FALSE)
+    
+    xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+    
+    x_pdac3 <-  x %>% 
+      ungroup() %>%
+      filter(model == 'PDAC-3') %>% 
+      mutate(model = as.character(model))
+    x_patient <-  x %>% 
+      ungroup() %>%
+      filter(model == 'Patient') %>% 
+      mutate(model = as.character(model))
+    
+    
+    for(i in levels(x$Description)) {
+      if(!i %in% x_pdac3$Description ) {
+        x_pdac3 %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'PDAC-3',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+      if(!i %in% x_patient$Description ) {
+        x_patient %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'Patient',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+    }
+    
+    
+    # Remove redundancy
+    x_pdac3 %<>% 
+      group_by(gene_set_group, Description) %>% 
+      slice_min(pvalue, n = 1, with_ties = FALSE)
+    x_patient %<>% 
+      group_by(gene_set_group, Description) %>% 
+      slice_min(pvalue, n = 1, with_ties = FALSE)
+    
+    
+    # Refactor Description
+    x_pdac3 %<>% 
+      mutate(
+        Description = as.character(Description),
+        Description = factor(Description, levels = levels(x$Description))
+      )
+    x_patient %<>% 
+      mutate(
+        Description = as.character(Description),
+        Description = factor(Description, levels = levels(x$Description))
+      )      
+    
+    
+    res_1 <- x_pdac3 %>%
+      ggplot(aes(x = NES, y = Description, size = log10P, fill = NES)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      # geom_point(data = x_pdac3 %>% filter(is.sign == 'yes'), pch = 21, aes(color = is.sign)) +
+      # geom_point(data = x_pdac3 %>% filter(is.sign == 'no'), pch = 21, stroke = 0) +
+      facet_grid(cols = vars(model), rows = vars(gene_set_group), scales = 'free_y', space = 'free_y') +
+      labs(
+        x = '',
+        y = '',
+        size = expression(paste("lo", g[10],"(FDR)")),
+        color = 'FDR\n< 0.05'
+      ) +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      scale_size_continuous(range=c(0.5, 1.1)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank(),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        
+        legend.text = element_text(size = 3), 
+        legend.title = element_text(size = 3),
+        legend.key.width = unit(0.1, "cm"),
+        legend.key.height = unit(0.1, "cm"),
+        
+        plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+
+    res_2 <- x_patient %>%
+      ggplot(aes(x = NES, y = Description, size = log10P, fill = NES)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      # geom_point(data = x_patient %>% filter(is.sign == 'yes'), pch = 21, aes(color = is.sign)) +
+      # geom_point(data = x_patient %>% filter(is.sign == 'no'), pch = 21, stroke = 0) +
+      facet_grid(cols = vars(model), rows = vars(gene_set_group), scales = 'free_y', space = 'free_y') +
+      labs(
+        x = '',
+        y = '',
+        size = expression(paste("lo", g[10],"(FDR)")),
+        color = 'FDR\n< 0.05'
+      ) +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      scale_size_continuous(range=c(0.5, 1.1)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      theme(
+        panel.border = element_rect(color = "black", 
+                                    fill = NA, 
+                                    linewidth = linewidth_default),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank(),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", 
+                                  linewidth = linewidth_default/2),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        
+        legend.text = element_text(size = 3), 
+        legend.title = element_text(size = 3),
+        legend.key.width = unit(0.1, "cm"),
+        legend.key.height = unit(0.1, "cm"),
+        
+        plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+        
+        
+    n_gsets <- x$ID %>% unique() %>% length()
+    n_gsgroups <- x$gene_set_group %>% unique %>% length
+    
+
+    # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+    # nmodels <- x$model %>% unique() %>% length()
+    nmodels <- 1
+
+    # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+    use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+    
+    # Calculate height: top margin + tickmarks + bottom margin and legend
+    use_height <- 0.0217 + 0.0217 + n_gsets * 0.0492 + (0.035*(n_gsgroups - 1)) + 0.4984
+
+    
+    # Print PDAC-3
+    subchunkify(res_1 +
+                  guides(
+                    size  = guide_legend(direction = "vertical",
+                                         keyheight = unit(0.0289, "inches"),
+                                         keywidth = unit(0.0289, "inches")
+                                         ),
+                    color = "none",
+                    fill  = "none"
+                    # color = guide_legend(direction = "vertical"),
+                    # fill  = guide_colourbar(direction = "vertical")
+                  ) +
+                  theme(
+                    legend.position = "bottom",
+                    legend.box = "horizontal"
+                  ),
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-sign-dotplot-unnamed-separated-pdac3',
+                suffix = comp )
+    
+    cat("\n\n")
+    
+    # Print legend
+    res_legend <- get_legend(
+      res_1 +
+        guides(
+          color = guide_legend(direction = "vertical"),
+          size  = guide_legend(direction = "vertical"),
+          fill  = guide_colourbar(direction = "vertical")
+        ) +
+        theme(
+          legend.position = "bottom",
+          legend.box = "horizontal"
+        )
+    )
+    subchunkify(plot_grid(res_legend),
+                fig.width = 1.8,
+                fig.height = 1,
+                dpi = 600,
+                prefix = 'gse-sign-dotplot-legend-unnamed-separated-pdac3',
+                suffix = comp )
+
+    cat("\n\n")
+    
+      
+    # Print Patient
+    subchunkify(res_2 +
+                  guides(
+                    size  = guide_legend(direction = "vertical",
+                                         keyheight = unit(0.0289, "inches"),
+                                         keywidth = unit(0.0289, "inches")
+                                         ),
+                    color = "none",
+                    fill  = "none"
+                    # color = guide_legend(direction = "vertical"),
+                    # fill  = guide_colourbar(direction = "vertical")
+                  ) +
+                  theme(
+                    legend.position = "bottom",
+                    legend.box = "horizontal"
+                  ),
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-sign-dotplot-unnamed-separated-patient',
+                suffix = comp )
+    
+    cat("\n\n")
+    
+    # Print legend
+    res_legend <- get_legend(
+      res_2 +
+        guides(
+          color = guide_legend(direction = "vertical"),
+          size  = guide_legend(direction = "vertical"),
+          fill  = guide_colourbar(direction = "vertical")
+        ) +
+        theme(
+          legend.position = "bottom",
+          legend.box = "horizontal"
+        )
+    )
+    subchunkify(plot_grid(res_legend),
+                fig.width = 1.8,
+                fig.height = 1,
+                dpi = 600,
+                prefix = 'gse-sign-dotplot-legend-unnamed-separated-patient',
+                suffix = comp )
+
+    cat("\n\n")
+  }
+  
+}
+```
+
+
+
+
+
+
+
+## Dot plots simplified (complete)
+
+```{r gse-dotplots-simplified, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+root_section_number <- 3
+section_n <- 1
+
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h3> <span class=\"header-section-number\">",h_section_number,"</span>", comp, "</h3>\n\n") #Cause results='asis',we must use raw HTML
+  section_n <- section_n + 1
+
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes)
+    )
+  if(nrow(x) == 0) {
+    cat("No gene sets significant in at least two models.\n\n")
+  } else {
+    xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+    
+    x_pdac3 <-  x %>% 
+      filter(model == 'PDAC-3')
+    x_patient <-  x %>% 
+      filter(model == 'Patient')
+    
+    for(i in levels(x$Description)) {
+      if(!i %in% x_pdac3$Description ) {
+        x_pdac3 %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'PDAC-3',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+      if(!i %in% x_patient$Description ) {
+        x_patient %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'Patient',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+    }
+    
+    # PDAC3: Select representative for each gene set group and model, to avoid redundancy in the plot.
+    x_median <- x_pdac3 %>% 
+      group_by(gene_set_group) %>% 
+      summarise(
+        group_n = n(),
+        group_nes = median(NES)
+      ) %>% 
+      mutate(
+        group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+      ) %>% 
+      arrange(group_nes)
+    x_pdac3 <- x_pdac3 %>% 
+      left_join(x_median) %>% 
+      filter(.sign == group_sign) %>% 
+      group_by(Group) %>%
+      slice_min(p.adjust, n = 1, with_ties = FALSE)
+    
+    # Patient: Select representative for each gene set group and model, to avoid redundancy in the plot.
+    x_median <- x_patient %>% 
+      group_by(gene_set_group) %>% 
+      summarise(
+        group_n = n(),
+        group_nes = median(NES)
+      ) %>% 
+      mutate(
+        group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+      ) %>% 
+      arrange(group_nes)
+    x_patient<- x_patient %>% 
+      left_join(x_median) %>% 
+      filter(.sign == group_sign) %>% 
+      group_by(Group) %>%
+      slice_min(p.adjust, n = 1, with_ties = FALSE)
+
+    
+    # Refactor Description
+    group_levels <- x_pdac3 %>% arrange(NES) %>% pull(Group)
+    x_pdac3 %<>% 
+      mutate(
+        gene_set_group = factor(gene_set_group, levels = group_levels)
+        )
+    x_patient %<>% 
+      mutate(
+        gene_set_group = factor(gene_set_group, levels = group_levels)
+        )      
+    
+    # Generate plots
+    res_1 <- x_pdac3 %>% 
+      ggplot(aes(x = NES, y = gene_set_group, size = log10P, fill = NES)) +
+      # geom_point(pch = 21, aes(color = is.sign)) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      facet_grid(cols = vars(model), scales = 'free_y', space = 'free_y') +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      labs(
+        y = '',
+        size = expression(paste("lo", g[10],"(Adjusted P value)")),
+        color = 'FDR < 0.05'
+        # caption = 'Gene sets with FDR<0.05 in at least 2 models',
+      ) +
+      scale_size_continuous(range=c(0.8, 2)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      # scale_color_viridis_c() +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_text(angle = 0, hjust = 0),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+        axis.text.y = element_text(size = 4),
+        axis.text.x = element_text(size = 4),
+        
+        legend.text = element_text(size = 4), 
+        legend.title = element_text(size = 4),
+        legend.key.width = unit(0.2, "cm"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+    
+    res_2 <- x_patient %>% 
+      ggplot(aes(x = NES, y = gene_set_group, size = log10P, fill = NES)) +
+      # geom_point(pch = 21, aes(color = is.sign)) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      facet_grid(cols = vars(model), scales = 'free_y', space = 'free_y') +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      labs(
+        y = '',
+        size = expression(paste("lo", g[10],"(Adjusted P value)")),
+        color = 'FDR < 0.05'
+        # caption = 'Gene sets with FDR<0.05 in at least 2 models',
+      ) +
+      scale_size_continuous(range=c(0.8, 2)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      # scale_color_viridis_c() +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_text(angle = 0, hjust = 0),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+        axis.text.y = element_text(size = 4),
+        axis.text.x = element_text(size = 4),
+        
+        legend.text = element_text(size = 4), 
+        legend.title = element_text(size = 4),
+        legend.key.width = unit(0.2, "cm"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+    
+    n_gsets <- x_patient$Group %>% unique() %>% length()
+    # use_width <-  7.2 + n_gsets * 0.02
+    use_width <- 2.2
+    # use_asp <-  0.318 + n_gsets * 0.017
+    # use_asp <-  n_gsets * 0.05
+    use_asp <-  n_gsets * 0.051
+    use_height <- use_width * use_asp
+    
+
+    subchunkify(res_1,
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot-simplified-pdac3',
+                suffix = comp )
+    cat("\n\n")
+    subchunkify(res_2,
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot-simplified-patient',
+                suffix = comp )   
+    
+    cat("\n\n")
+  }
+  
+}
+```
+
+
+## Dot plots simplified (unamed)
+
+```{r gse-dotplots-simplified-unnamed, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+root_section_number <- 4
+section_n <- 1
+
+comp <- names(gse_list_merged)[1]
+for(comp in names(gse_list_merged)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h3> <span class=\"header-section-number\">",h_section_number,"</span>", comp, "</h3>\n\n") #Cause results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes)
+    )
+  if(nrow(x) == 0) {
+    cat("No gene sets significant in at least two models.\n\n")
+  } else {
+
+    # Remove redundancy
+    x %<>% 
+      group_by(model, gene_set_group, Description) %>% 
+      slice_min(avg_fdr, n = 1, with_ties = FALSE)
+    
+    xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+    
+    x_pdac3 <-  x %>% 
+      ungroup() %>%
+      filter(model == 'PDAC-3') %>% 
+      mutate(model = as.character(model))
+    x_patient <-  x %>% 
+      ungroup() %>%
+      filter(model == 'Patient') %>% 
+      mutate(model = as.character(model))
+    
+    
+    for(i in levels(x$Description)) {
+      if(!i %in% x_pdac3$Description ) {
+        x_pdac3 %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'PDAC-3',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+      if(!i %in% x_patient$Description ) {
+        x_patient %<>% add_row(
+          ID = x %>% filter(Description == i) %>% pull(ID) %>% unique(),
+          Description = i,
+          NES = 0,
+          p.adjust = 1,
+          model = 'Patient',
+          gene_set_group = x %>% filter(Description == i) %>% pull(gene_set_group) %>% unique(),
+          n_significant = 0,
+          n_up = 0,
+          avg_fdr = 1,
+          avg_nes = 0,
+          log10P = 0,
+          is.sign = 'no'
+        )
+      }
+    }
+    
+    
+    # PDAC3: Select representative for each gene set group and model, to avoid redundancy in the plot.
+    x_median <- x_pdac3 %>% 
+      group_by(gene_set_group) %>% 
+      summarise(
+        group_n = n(),
+        group_nes = median(NES)
+      ) %>% 
+      mutate(
+        group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+      ) %>% 
+      arrange(group_nes)
+    x_pdac3 <- x_pdac3 %>% 
+      left_join(x_median) %>% 
+      filter(.sign == group_sign) %>% 
+      group_by(Group) %>%
+      slice_min(p.adjust, n = 1, with_ties = FALSE)
+    
+    # Patient: Select representative for each gene set group and model, to avoid redundancy in the plot.
+    x_median <- x_patient %>% 
+      group_by(gene_set_group) %>% 
+      summarise(
+        group_n = n(),
+        group_nes = median(NES)
+      ) %>% 
+      mutate(
+        group_sign = ifelse(group_nes > 0, 'activated', 'supressed')
+      ) %>% 
+      arrange(group_nes)
+    x_patient<- x_patient %>% 
+      left_join(x_median) %>% 
+      filter(.sign == group_sign) %>% 
+      group_by(Group) %>%
+      slice_min(p.adjust, n = 1, with_ties = FALSE)
+
+    
+    # Refactor Description
+    group_levels <- x_pdac3 %>% arrange(NES) %>% pull(Group)
+    x_pdac3 %<>% 
+      mutate(
+        gene_set_group = factor(gene_set_group, levels = group_levels)
+        )
+    x_patient %<>% 
+      mutate(
+        gene_set_group = factor(gene_set_group, levels = group_levels)
+        )      
+    
+    
+    res_1 <- x_pdac3 %>%
+      ggplot(aes(x = NES, y = gene_set_group, size = log10P, fill = NES)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      # geom_point(data = x_pdac3 %>% filter(is.sign == 'yes'), pch = 21, aes(color = is.sign)) +
+      # geom_point(data = x_pdac3 %>% filter(is.sign == 'no'), pch = 21, stroke = 0) +
+      facet_grid(cols = vars(model), scales = 'free_y', space = 'free_y') +
+      labs(
+        x = '',
+        y = '',
+        # title = 'PDAC-3',
+        size = expression(paste("lo", g[10],"(FDR)")),
+        color = 'FDR\n< 0.05'
+      ) +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      scale_size_continuous(range=c(0.5, 1.1)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      theme(
+        panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank(),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = linewidth_default/2),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        
+        legend.text = element_text(size = 3), 
+        legend.title = element_text(size = 3),
+        legend.key.width = unit(0.1, "cm"),
+        legend.key.height = unit(0.1, "cm"),
+        
+        plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+
+    res_2 <- x_patient %>%
+      ggplot(aes(x = NES, y = gene_set_group, size = log10P, fill = NES)) +
+      geom_vline(xintercept = 0, lty = 3) +
+      geom_point(pch = 21, stroke = linewidth_default/2) +
+      # geom_point(data = x_patient %>% filter(is.sign == 'yes'), pch = 21, aes(color = is.sign)) +
+      # geom_point(data = x_patient %>% filter(is.sign == 'no'), pch = 21, stroke = 0) +
+      facet_grid(cols = vars(model), scales = 'free_y', space = 'free_y') +
+      labs(
+        x = '',
+        y = '',
+        # title = 'Patient',
+        size = expression(paste("lo", g[10],"(FDR)")),
+        color = 'FDR\n< 0.05'
+      ) +
+      scale_y_discrete(labels =  default_labeller(80)) +
+      scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                         limits = xlim) +
+      scale_size_continuous(range=c(0.5, 1.1)) +
+      scale_fill_gradient2(trans = "reverse") +
+      scale_color_manual(values = c(no = 'white', yes = 'black')) +
+      theme(
+        panel.border = element_rect(color = "black", 
+                                    fill = NA, 
+                                    linewidth = linewidth_default),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank(),
+        
+        axis.line = element_blank(),
+        axis.ticks = element_line(color = "black", 
+                                  linewidth = linewidth_default/2),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        
+        legend.text = element_text(size = 3), 
+        legend.title = element_text(size = 3),
+        legend.key.width = unit(0.1, "cm"),
+        legend.key.height = unit(0.1, "cm"),
+        
+        plot.margin = unit(c(0.0217, 0.0217, 0.0217, 0.0217), "inches"),
+        panel.spacing.y = unit(0.08, "lines")
+      )
+        
+        
+    n_gsets <- x_patient$ID %>% unique() %>% length()
+    n_gsgroups <- x_patient$gene_set_group %>% unique %>% length
+    
+    
+    
+    # Calculate width = left margin + total width of panels + total width of spacing + right margin. Everything scaled by conversion factor to get final width in inches. Conversion factor calculater with a rule in the screen
+    # nmodels <- x$model %>% unique() %>% length()
+    nmodels <- 1
+    
+    # Calculate width: left margin + tickmarks + total width of panels + total width of spacing + right margin
+    # use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+    use_width <- 0.1165 + 0.0173 + (0.18898*nmodels) + (0.035*(nmodels - 1))+ 0.0217
+    
+    # Calculate height: top margin + tickmarks + bottom margin and legend
+    use_height <- 0.0217 + 0.0217 + (n_gsets*1.05) * 0.0492 + (0.015*(n_gsgroups - 1)) + 0.4984
+    
+    
+    # Print PDAC-3
+    subchunkify(res_1 +
+                  guides(
+                    size  = guide_legend(direction = "vertical",
+                                         keyheight = unit(0.0289, "inches"),
+                                         keywidth = unit(0.0289, "inches")
+                                         ),
+                    color = "none",
+                    fill  = "none"
+                    # color = guide_legend(direction = "vertical"),
+                    # fill  = guide_colourbar(direction = "vertical")
+                  ) +
+                  theme(
+                    legend.position = "bottom",
+                    legend.box = "horizontal"
+                  ),
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot-simplified-unnamed-pdac3',
+                suffix = comp )
+    
+    cat("\n\n")
+    
+    # Print legend
+    res_legend <- get_legend(
+      res_1 +
+        guides(
+          color = guide_legend(direction = "vertical"),
+          size  = guide_legend(direction = "vertical"),
+          fill  = guide_colourbar(direction = "vertical")
+        ) +
+        theme(
+          legend.position = "bottom",
+          legend.box = "horizontal"
+        )
+    )
+    subchunkify(plot_grid(res_legend),
+                fig.width = 1.8,
+                fig.height = 1,
+                dpi = 600,
+                prefix = 'gse-dotplot-legend-simplified-unnamed-pdac3',
+                suffix = comp )
+
+    cat("\n\n")
+    
+      
+    # Print Patient
+    subchunkify(res_2 +
+                  guides(
+                    size  = guide_legend(direction = "vertical",
+                                         keyheight = unit(0.0289, "inches"),
+                                         keywidth = unit(0.0289, "inches")
+                                         ),
+                    color = "none",
+                    fill  = "none"
+                    # color = guide_legend(direction = "vertical"),
+                    # fill  = guide_colourbar(direction = "vertical")
+                  ) +
+                  theme(
+                    legend.position = "bottom",
+                    legend.box = "horizontal"
+                  ),
+                fig.width = use_width,
+                fig.height = use_height,
+                dpi = 600,
+                prefix = 'gse-dotplot-simplified-unnamed-patient',
+                suffix = comp )
+    
+    cat("\n\n")
+    
+    # Print legend
+    res_legend <- get_legend(
+      res_2 +
+        guides(
+          color = guide_legend(direction = "vertical"),
+          size  = guide_legend(direction = "vertical"),
+          fill  = guide_colourbar(direction = "vertical")
+        ) +
+        theme(
+          legend.position = "bottom",
+          legend.box = "horizontal"
+        )
+    )
+    subchunkify(plot_grid(res_legend),
+                fig.width = 1.8,
+                fig.height = 1,
+                dpi = 600,
+                prefix = 'gse-dotplot-legend-simplified-unnamed-patient',
+                suffix = comp )
+
+    cat("\n\n")
+  }
+  
+}
+```
+
+
+
+
+
+
+
+
+## Download results
+```{r gse-table-download, echo=FALSE}
+library(openxlsx)
+comp <- names(gse_list_merged)[1]
+
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 'gse_integration.xlsx'
+                           )
+
+dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+  
+wb <- createWorkbook()
+
+# Add a table with unique pathways
+gset_unique <- foreach(i=gse_list_merged) %do% {
+  i %>% pull(ID)
+} %>% unlist %>% unique %>% data.frame() %>% set_names(c('ID')) %>% mutate(Group=NA) 
+addWorksheet(wb, 'Unique_gene_sets')
+writeData(wb, 'Unique_gene_sets', gset_unique)
+
+# Add a table for each comparison
+for(comp in names(gse_list_merged)) {
+  x <- gse_list_merged[[comp]] %>% 
+    arrange(desc(n_up), desc(avg_nes)) %>% 
+    mutate(
+      is.sign = ifelse(p.adjust < 0.05, 'yes', 'no'),
+      log10P = -log10(p.adjust),
+      Description = clean_msigdb_names(Description),
+      Description = fct_reorder(Description, avg_nes)
+    )
+  addWorksheet(wb, comp)
+  writeData(wb, comp, x)
+}
+
+saveWorkbook(wb, file_xlsx, TRUE)
+ file_xlsx <- gsub("docs/", "", file_xlsx)
+cat(paste0("- [**GSEA integration**](", file_xlsx, ")"), '\n\n')
+
+```
+
+
+
+
+

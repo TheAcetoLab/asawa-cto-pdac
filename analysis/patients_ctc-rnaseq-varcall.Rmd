@@ -1,0 +1,438 @@
+---
+title: "Analysis of PDAC CTC patient samples"
+subtitle: "Variant calling"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  data_dir: ./data/rnaseq/patients-ctc/haplotype_caller
+  se_path: ./data/rnaseq/patients-ctc/se_qc.rds
+  output_dir: ./output/rnaseq/patients-ctc/variant_calling
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, 
+                      error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), 
+                      engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(janitor)
+library(VariantAnnotation)
+library(ComplexHeatmap)
+library(circlize)
+library(edgeR)
+library(scuttle)
+library(HoneyBADGER)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(biomaRt)
+library(ggvenn)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+## Data processing
+
+Load data SummarizedExperiment object
+```{r load-se}
+se <- readRDS(params$se_path)
+```
+
+Load donor VCF files
+```{r load-vcf, eval = FALSE}
+donor_levels <- unique(se$donor)
+rna_vcf <- foreach(donor = donor_levels) %do% {
+  vcf_file <- file.path(
+    params$data_dir,
+    paste0(donor, '.ann.dbsnp.cosmic.vcf.gz')
+    )
+  res <- readVcf(vcf_file, 'GRCh38')
+  names(res) %<>% gsub(';', '.', .)
+  res
+}
+names(rna_vcf) <- donor_levels
+
+saveRDS(rna_vcf, file = file.path(params$output_dir, 'rna_vcf.rds'))
+```
+
+Load donor TSV files
+```{r load-tsv, eval = FALSE}
+donor_levels <- unique(se$donor)
+rna_tsv <- foreach(donor = donor_levels) %do% {
+  tsv_file <- file.path(
+    params$data_dir,
+    paste0(donor, '.ann.dbsnp.cosmic.tsv.gz')
+    )
+  ## load data
+  res <- read_tsv(tsv_file, comment = '#')
+  res_col_spc <- read_tsv(tsv_file, comment = '#', col_types=cols_only(SAMPLE_COUNT = "n", GENE = "c"))
+  res$SAMPLE_COUNT <- res_col_spc$SAMPLE_COUNT
+  res$GENE <- res_col_spc$GENE
+  rm(res_sample_count)
+  
+  ## modify colnames
+  colnames(res) %<>% 
+    gsub('\\.\\.\\..*', '', .) %>% 
+    gsub('\\[.*\\]', '', .) %>% 
+    make.names(unique = TRUE)
+  ## modify data
+  res %<>% 
+    ## add ID to is.na(ID)==TRUE
+    mutate(ID = ifelse(
+        is.na(ID), 
+        paste0(CHROM, '.', POS, '_', REF, '.',ALT), 
+        ID)
+      ) %>% 
+    ## in ID, convert ';' to '.' to match VCF ID
+    mutate(
+      ID = gsub(';', '.', ID),
+      IDc = paste(ANN.GENE, ANN.HGVS_C),
+      IDp = paste(ANN.GENE, ANN.HGVS_P),
+      ANN.IMPACT = factor(ANN.IMPACT, levels = c('HIGH', 'MODERATE', 'LOW', 'MODIFIER'))
+    )
+
+  # Annotate somatic variants
+  res %<>% 
+    mutate(somatic = ifelse(!G5 & SAMPLE_COUNT > 1, TRUE, FALSE))
+  
+  res
+}
+
+names(rna_tsv) <- donor_levels
+
+
+saveRDS(rna_tsv, file = file.path(params$output_dir, 'rna_tsv.rds'))
+
+```
+
+Load processed files
+```{r load-processed-data}
+rna_vcf <- readRDS(file.path(params$output_dir, 'rna_vcf.rds'))
+rna_tsv <- readRDS(file.path(params$output_dir, 'rna_tsv.rds'))
+```
+
+
+Load PDAC genes from cBioportal
+```{r load-pdac-genes}
+pdac_cbio <- read_tsv("./data/external/pdac_cbioportal_mutated_genes.txt") %>% 
+  dplyr::rename(gene = Gene) %>% 
+  mutate(cbio_freq = gsub("\\%", "", Freq) %>% as.numeric) %>%
+  dplyr::select(gene, cbio_freq, `Is Cancer Gene (source: OncoKB)`) |> 
+  filter(`Is Cancer Gene (source: OncoKB)` == 'Yes' & !is.na(cbio_freq))
+```
+
+
+## Tables : Putative somatic variants
+Criteria for somatic mutation definition:
+
+  - More than 5% minor allele frequency in 1+ populations
+  
+  - Present in COSMIC with two or more occurrences
+  
+```{r rna-somatic-table}
+# for(donor in names(rna_tsv)) {
+rna_tsv_somatic <- foreach(donor = names(rna_tsv), .combine = rbind) %do% {
+  res <- rna_tsv[[donor]] %>% 
+    mutate(donor = donor) %>% 
+    filter(somatic) %>%
+    dplyr::rename(cosmic_sample_count = SAMPLE_COUNT) %>% 
+    dplyr::select(donor, everything())
+  
+  # add number of sampels mutated in the study
+  use_snpmat <- genotypeToSnpMatrix(rna_vcf[[donor]])$genotypes %>% data.frame
+  use_snpmat_n <- use_snpmat[,res$ID] %>% 
+    mutate_all(as.numeric)
+  add_counts <- data.frame(sample_count = colSums(use_snpmat_n > 1)) %>% 
+    rownames_to_column('ID')
+  
+  res %>% 
+    left_join(add_counts)
+
+}
+
+res_tab <- rna_tsv_somatic %>%
+  dplyr::select(
+    donor, GENE, QUAL, sample_count, ANN.HGVS_C, ANN.HGVS_P, 
+    cosmic_sample_count, ID, ANN.EFFECT, 
+    ANN.IMPACT, TIER, CAF) %>% 
+  rename_with(function(x) gsub("ANN.", "", x)) %>% 
+  clean_names() %>% 
+  mutate(impact_n = as.numeric(impact)) %>% 
+  left_join(pdac_cbio)
+
+
+res_tab %>% 
+  mutate(caf = ifelse(is.na(caf), 0, caf)) %>% 
+  datatable(., 
+            rownames = FALSE, 
+            filter = 'top', 
+            caption = 'Potential somatic mutations identified with RNA-seq',
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c('csv', 'excel')
+            ))
+```
+
+## Figures : Putative somatic variants
+
+Criteria for somatic mutation definition:
+
+  - More than 5% minor allele frequency in 1+ populations
+  
+  - Present in COSMIC with two or more occurrences
+  
+  - Effect : High or Moderate impact
+  
+  - Gene present in the list of cBioPortal selected PDAC genes as cancer gene in OncoKB
+  
+  - Remove HLA genes
+
+```{r rna-somatic-txomic-data}
+samples_to_remove <- colnames(se)[se$outlier_discard]
+donor_levels <- unique(se$donor)
+rna_somatic_var_data <- foreach(donor = donor_levels) %do% {
+  use_vcf <- rna_vcf[[donor]]
+  use_snpmat <- genotypeToSnpMatrix(use_vcf)
+  use_var_annot <- rna_tsv[[donor]]
+  
+  # Extract Genotypes
+  use_geno <- use_snpmat$genotypes %>% data.frame
+  
+  # Filter variants 
+  use_variants <- use_var_annot %>% 
+    filter(somatic) %>%
+    filter(GENE %in% pdac_cbio$gene) %>%
+    filter(ANN.IMPACT %in% c('HIGH', 'MODERATE')) %>%
+    filter(!grepl("^HLA", GENE)) %>%
+    pull(ID) %>% unique
+  
+  if(length(use_variants) == 0) {
+    NULL
+  } else{
+    # Extract DP (Approximate read depth) 
+    use_dp <- geno(use_vcf)$DP
+    use_dp[is.na(use_dp)] <- 0
+    use_dp <- use_dp[colnames(use_snpmat$genotypes),] %>% data.frame
+    use_dp <- t(use_dp)
+    
+    # Extract AD (allelic depths) for the ref and alt alleles in the order listed 
+    use_ad0 <- geno(use_vcf)$AD
+    use_ad0 <- use_ad0[use_variants,, drop = FALSE]
+    use_ad <- apply(use_ad0, 2, function(xi) {
+      x <- xi[[1]]
+      res_i <- foreach(x = xi) %do% {
+        if(length(x) >= 2) {
+          res <- unlist(x) %>% paste(collapse = ',')
+        } else {
+          res <- NA
+        }
+        if(grepl("^NA", res))
+          res <- NA
+        res
+      }
+      unlist(res_i)
+    })
+    if(!is.matrix(use_ad)) {
+      use_ad <- as.matrix(use_ad) %>% t()
+    }
+    rownames(use_ad) <- rownames(use_ad0)
+    use_ad <- use_ad %>% data.frame
+    use_ad <- t(use_ad)
+    
+    # Extract Allelic proportion from AD (allelic depths) for the ref and alt alleles in the order listed 
+    use_ad0 <- geno(use_vcf)$AD
+    use_ad0 <- use_ad0[use_variants,, drop = FALSE]
+    xi <- use_ad0[,2]
+    use_ap <- apply(use_ad0, 2, function(xi) {
+      x <- xi[[1]]
+      res_i <- foreach(x = xi) %do% {
+        if(length(x) >= 2) {
+          x[2] / sum(x)
+        } else {
+          NA
+        }
+      }
+      unlist(res_i)
+    })
+    if(!is.matrix(use_ap)) {
+      use_ap <- as.matrix(use_ap) %>% t()
+    }
+    rownames(use_ap) <- rownames(use_ad0)
+    use_ap <- use_ap %>% data.frame
+    use_ap <- t(use_ap)
+    
+    # Filter variants 
+    use_geno <- use_geno[,use_variants, drop = FALSE]
+    use_ad <- use_ad[,use_variants, drop = FALSE]
+    use_ap <- use_ap[,use_variants, drop = FALSE]
+    use_dp <- use_dp[,use_variants, drop = FALSE]
+    
+    # Sort Annot by column order in use_geno
+    use_var_annot <- use_var_annot[match(colnames(use_geno), use_var_annot$ID),,drop = FALSE]
+    # colnames(use_geno)[colnames(use_geno) != use_var_annot$ID]
+    
+    # # Filter variants by QUAL
+    # use_variants <- use_var_annot %>% filter(QUAL >= 20) %>% 
+    #   pull(ID) %>% unique
+    # # table(use_variants %in% colnames(use_geno))
+    # use_geno <- use_geno[,use_variants]
+    
+    # Sort Annot by column order in use_geno
+    # use_var_annot <- use_var_annot[match(colnames(use_geno), use_var_annot$ID),]
+    # colnames(use_geno)[colnames(use_geno) != use_var_annot$ID]
+    
+    # New variant names
+    gene_info <- use_var_annot %>% 
+      dplyr::select(ID, ANN.GENE, ANN.HGVS_C, ANN.HGVS_P) %>% 
+      unique %>% 
+      mutate(
+        newID = paste(ANN.GENE, ANN.HGVS_C)
+      ) %>% 
+      filter(ID %in% colnames(use_geno))
+    
+    # gene_info %>% filter(ID == 'rs1799943.COSV61525225')
+    
+    # Some ID are repeated in the annotation (eg.:same variant in overlapping genes)
+    # Duplicate columns from use_geno to match annotation
+    use_geno <- use_geno[,gene_info$ID, drop = FALSE]
+    colnames(use_geno) <- gene_info$newID
+    use_ad <- use_ad[,gene_info$ID, drop = FALSE]
+    colnames(use_ad) <- gene_info$newID
+    use_ap <- use_ap[,gene_info$ID, drop = FALSE]
+    colnames(use_ap) <- gene_info$newID
+    use_dp <- use_dp[,gene_info$ID, drop = FALSE]
+    colnames(use_dp) <- gene_info$newID
+    
+    # # Remove samples
+    # samples_to_keep <- setdiff(rownames(use_geno), samples_to_remove)
+    # use_geno <- use_geno[samples_to_keep,]
+    # use_ad <- use_ad[samples_to_keep,]
+    # use_ap <- use_ap[samples_to_keep,]
+    # use_dp <- use_dp[samples_to_keep,]
+    # 
+    res <- list(
+      geno = use_geno,
+      ad = use_ad,
+      ap = use_ap,
+      dp = use_dp
+    )
+    
+    rm(use_vcf, use_snpmat, use_var_annot, use_geno)
+    
+    res
+  }
+}
+names(rna_somatic_var_data) <- donor_levels
+```
+
+```{r rna-somatic-txomic-plot-oncoprint, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+donor_levels <- unique(se$donor)
+op_list <- list()
+for(donor in donor_levels) {
+  use_geno <- rna_somatic_var_data[[donor]]$geno
+  if(!is.null(use_geno)) {
+    mat <- t(use_geno)
+    mat[mat == '00'] <- ''
+    colnames(mat) <- gsub(".*-", "", colnames(mat))
+    colnames(mat) <- gsub("^SA_", "", colnames(mat))
+    mat <- mat[,colnames(mat) %in% colnames(se), drop = FALSE]
+    
+    #Set col roder
+    column_ord <- apply(mat, 2, function(x) sum(x %in% c("02", "03"))) %>% 
+      sort(decreasing = TRUE) %>% names
+    # Set row order
+    # mut_prop <- apply(mat, 1, function(x) sum(x %in% c("02", "03")) / sum(x != ''))
+    mut_n <- apply(mat, 1, function(x) sum(x %in% c("02", "03")))
+    row_ord <- sort(mut_n, decreasing = TRUE) %>% names
+    
+    # col = c("01" = "#4575b4", "02" = "#fdae61", "03" = "#d73027")
+    col = c("01" = "#e0e0e0", "02" = palette_OkabeIto[1], "03" = palette_OkabeIto[2])
+    alter_fun = list(
+      background = alter_graphic("rect", fill = "white"),
+      `01` = alter_graphic("rect", fill = col["01"]),
+      `02` = alter_graphic("rect", fill = col["02"]),
+      `03` = alter_graphic("rect", fill = col["03"])
+    )
+    
+    column_title = paste0(donor, ": Somatic RNA-seq variants")
+    heatmap_legend_param = list(title = "Alterations", at = c("01", "02", "03"), 
+                                labels = c("0/0", "0/1", "1/1"))
+    
+    op <- oncoPrint(mat,
+                    alter_fun = alter_fun, 
+                    col = col, 
+                    column_title = column_title, 
+                    heatmap_legend_param = heatmap_legend_param,
+                    show_column_names = TRUE,
+                    column_order = column_ord,
+                    row_order = row_ord)
+    
+    op_list[[donor]] <- op
+    # draw(op)
+    subchunkify(op, 
+                fig.width = 7.5, 
+                fig.height = (7.5*0.3) + nrow(mat)*0.3,
+                dpi = 600,
+                prefix = 'varcall-oncoprint',
+                suffix = donor )
+    cat("\n\n")
+  }
+}
+```

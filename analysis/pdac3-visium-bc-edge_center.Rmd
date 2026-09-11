@@ -1,0 +1,543 @@
+---
+title: "PDAC-3 spatial transcriptomics"
+subtitle: "Analysis of distance to edge an center for each barcode group"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  donor: PDAC-3
+  output_dir: ./output/rnaseq-spatial/pdac3
+  seurat_dir: ./data/rnaseq-spatial/pdac3
+  qupath_edge_dir: ./data/slide-images/pdac3-qupath/edge_annotation
+---
+
+
+
+## Configuration
+
+Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(knitr)
+library(magrittr)
+library(ggpubr)
+library(arsenal)
+library(Seurat)
+library(SummarizedExperiment)
+library(semla)
+library(sf)
+library(dbscan)
+
+
+library(plotly)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/semla_functions.r')
+```
+
+
+## Data processing
+
+Load human seurat data and get sample_alias to sampleID mapping
+```{r dw-load-seurat}
+seu <- readRDS(file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+# seu <- UpdateSeuratObject(seu)
+# saveRDS(seu, file.path(params$seurat_dir, 'seurat_hs/seurat_merged_semla_geneNMF.rds'))
+sample_alias_to_sampleID <- GetCoordinates(seu) %>% 
+  left_join(
+    seu[[]] %>% 
+      rownames_to_column('barcode') %>% 
+      select(barcode, sample_alias)
+  ) %>% 
+  select(sample_alias, sampleID) %>% unique
+```
+
+Load final data from barcode analysis report
+```{r dw-load-processed-data}
+seu_bc <- readRDS(file.path(params$output_dir, 'seurat_hs/seurat_bc_hotspots.rds'))
+seu_bc <- UpdateSeuratObject(seu_bc)
+# Load hotspot data
+hotspot_bc <- readRDS(file.path(params$output_dir, 'seurat_bc/semla_hotspots.rds'))
+```
+
+Add annotation to Seurat object
+```{r dw-add-annotation-seurat}
+# Add hotspots defined based on barcodes. We use the same criteria as in chunk::dw-bc-hotspots-to-seurat
+st_spots <- hotspot_bc$st_specific %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+ctc_spots <- hotspot_bc$ctc_top %>% 
+  filter(hotspot != 'singleton') %>% 
+  filter(hotspot_size >= 5) %>%
+  pull(sample_spot)
+
+seu[[]] %<>% 
+  rownames_to_column('sample_spot') %>%
+  mutate(
+    bc_group = ifelse(sample_spot %in% st_spots, 'ST', ifelse(sample_spot %in% ctc_spots, 'CTC', 'other'))
+  ) %>% 
+  column_to_rownames('sample_spot')
+
+```
+
+Extract xyz coordinates and convert to microns
+```{r dw-add-xy-um}
+use_seu <- seu
+
+# Get pxl to microns conversion factor. We will use the median of the pixel spot diameter across the different slices to calculate the conversion factor, and we will use the physical spot diameter of 55 microns provided by 10x as reference for the conversion. 
+physical_spot_um <- 55
+use_coords_list <- semla:::.get_coords_list(use_seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+
+# Convert_coordinates
+xy_coord <- use_seu@tools$Staffli@meta_data %>%  
+  select(barcode, pxl_col_in_fullres_transformed, pxl_row_in_fullres_transformed) %>%
+  set_names(c('barcode', 'x', 'y')) %>% 
+  mutate(
+    x = x * um_per_pxl,
+    y = y * um_per_pxl
+  )
+
+xyz_coord <- use_seu[[]] %>% 
+  mutate(
+    z = z_um
+  ) %>% 
+  rownames_to_column('barcode') %>%
+  left_join(xy_coord, by = 'barcode') %>% 
+  dplyr::select(barcode, x, y ,z)
+
+# Add coordinates to seurat objects
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(xyz_coord, by = 'barcode') %>%
+  column_to_rownames('barcode')
+seu_bc[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(xyz_coord, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+```
+
+
+Load the edge annotation from QuPath for each image, and transform the coordinates
+```{r dw-load-qupath}
+require(sf)
+qupath_edge_files <- list.files(params$qupath_edge_dir, pattern = "*.geojson", full.names = TRUE)
+
+# Load Transformations 
+rigid_transform <- readRDS(file.path(file.path(params$seurat_dir, 'seurat', 'rigid_transform.rds')))
+
+# Add image width and height to the transformations tibble
+st_object <- GetStaffli(seu)
+rigid_transform %<>% 
+  left_join(st_object@image_info %>% 
+              select(sampleID, full_width, full_height) %>% 
+              mutate(sampleID = as.numeric(sampleID))
+  )
+
+
+# Load and transform edge annotations for each sample. We will use the semla-naive transformation, which applies the scale, rotation and translation parameters to the coordinates.
+i <- 'S2_Y14Y20_338_B1'
+i <- 'S1_Y14Y20_336_D1'
+edge_coords <- foreach(i = sample_alias_to_sampleID$sample_alias) %do% {
+  # Remove serialnumber from the image name, because TIFF file names used by QuPath doesn't contain them
+  i_short <- (str_split(i, "_") %>% unlist)[-2]
+  i_short_qupath <- paste0(i_short[1], "_", i_short[2], "-", i_short[3])
+  # i_short_sample_id <- paste0(i_short[1], "_", i_short[3])
+  
+  # Load the QuPath annotation. coordinates are in fullres pixels at this point.
+  annot_file <- file.path(params$qupath_edge_dir, paste0("PDAC3_", i_short_qupath, ".geojson"))
+  if(file.exists(annot_file)){
+    qupath_annotation <- st_read(
+      annot_file,
+      quiet = TRUE)
+    
+    # Convert your QuPath annotation to an sf line (if it's a boundary)
+    # st_cast helps if you imported it as a Polygon but only want the edge
+    boundary_line <- st_cast(qupath_annotation, "LINESTRING")
+    
+    # Extract raw coordinates from the sf boundary object
+    # st_coordinates returns a matrix with X, Y, and potentially L1/L2 (path IDs)
+    boundary_coords <- as.data.frame(st_coordinates(boundary_line)) %>%
+      dplyr::rename(x = X, y = Y)
+    
+    # Extract transformations for the sample used
+    sample_id <- sample_alias_to_sampleID %>% 
+      filter(sample_alias == i) %>% 
+      pull(sampleID)
+    tr <- rigid_transform %>% filter(sampleID == sample_id) 
+    
+    
+    # Prepare parameters for the semla-native transformation, as in semla::CoordAndImageTransform
+    center <- c(tr$full_width/2, tr$full_height/2)
+    xy_offset <- c(
+      round(tr$tr_x*tr$full_width), 
+      round(tr$tr_y*tr$full_height)
+    )
+    
+    # Apply the semla-native transformation to the QuPath boundary coordinates
+    transformed_coords <- CoordTransform(
+      xy_coords = boundary_coords[,c('x', 'y')],
+      angle = tr$angle,
+      scalefactor = tr$scalefactor,
+      center = center,
+      xy_offset = xy_offset
+    )
+    
+    # Create a new boundary coordinates dataframe with the transformed coordinates
+    boundary_coords_t <- data.frame(
+      x = transformed_coords$tr_x,
+      y = transformed_coords$tr_y
+    )
+    
+    return(boundary_coords_t)
+  } else {
+    return(NULL)
+  }
+}
+names(edge_coords) <- sample_alias_to_sampleID$sample_alias
+edge_coords <- compact(edge_coords)
+
+```
+
+Convert edge coordinates to microns and add z coordinates
+```{r dw-edge-to-microns-3d}
+# Get pxl to microns conversion factor. We will use the median of the pixel spot diameter across the different slices to calculate the conversion factor, and we will use the physical spot diameter of 55 microns provided by 10x as reference for the conversion. 
+physical_spot_um <- 55
+use_coords_list <- semla:::.get_coords_list(seu)
+spatnet_list <- lapply(use_coords_list, GetSpatialNetwork, maxDist = 50)
+i <- spatnet_list[[1]]
+
+um_per_pxl <- foreach(i = spatnet_list) %do% {
+  pixel_spot_diameter <- i[[1]] %>% group_by(from) %>% summarise(min_distance = min(distance)) %>% pull(min_distance) %>% median
+  physical_spot_um / pixel_spot_diameter
+} %>% unlist %>% median
+
+# Get z_coordinates
+z_coord <- read_csv('./data/external/spatial_tx_annotation/pdac3_st_z_coordinates.csv', comment = "#") %>% select(sample_alias, z_um)
+
+# Convert_coordinates
+edge_coords_um <- foreach(i = names(edge_coords)) %do% {
+  use_coords <- edge_coords[[i]]
+  use_coords$x <- use_coords$x * um_per_pxl
+  use_coords$y <- use_coords$y * um_per_pxl
+  use_coords$z <- z_coord %>% filter(sample_alias == i) %>% pull(z_um) 
+  return(use_coords)
+}
+names(edge_coords_um) <- names(edge_coords)
+```
+
+
+Calculate distance to centroid for each point. We will use the centroids calculated in the previous step to calculate the distance from each point to the centroid of its corresponding slice. 
+```{r dw-centroid-dist}
+centroid_dist <- foreach(i = unique(xyz_coord$z)) %do% {
+  centroid_xy <- xyz_coord %>% 
+    filter(z == i) %>% 
+    summarise(
+      x = mean(x),
+      y = mean(y)
+    )
+  coord_i <- xyz_coord %>% 
+    filter(z == i) %>% 
+    mutate(
+      dist_center = sqrt((x - centroid_xy$x)^2 + (y - centroid_xy$y)^2)
+    )
+} %>% bind_rows()
+
+# Add distance to seurat objects
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(centroid_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+seu_bc[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(centroid_dist, by = 'barcode') %>%
+  column_to_rownames('barcode')
+
+```
+
+Calculate distance to the closest edge for each point. 
+```{r dw-edge-dist}
+require(dbscan)
+
+# Remove  "S1_Y14Y20_336_D1". Simran:  I had issues with samples in section S1_336_D1 and a part of it actually came off. So, please remove this from the edge analysis since we don’t have the entire section on the slide.
+xyz_coord_f <- xyz_coord %>% filter(!grepl('S1_Y14Y20_336_D1', barcode))
+
+# Calculate 3d distances
+query_coords <- bind_rows(edge_coords_um)
+knn_res <- kNN(x = query_coords[, c("x", "y", "z")] |> as.matrix(),
+               query = xyz_coord_f[, c("x", "y", "z")] |> as.matrix(),
+               k = 1)
+edge_dist_3d <- data.frame(
+  barcode = xyz_coord_f$barcode,
+  dist_edge_3d = knn_res$dist[, 1, drop = TRUE]
+)
+
+
+# Calculate 2d distance 
+use_xyz <- xyz_coord_f %>% 
+  left_join(seu[[]] %>% 
+              rownames_to_column('barcode') %>% 
+              select(barcode, sample_alias), 
+            by = 'barcode')
+use_xyz <- split(use_xyz, use_xyz$sample_alias)
+edge_dist_2d <- foreach(i = names(use_xyz), .combine = rbind) %do% {
+  knn_res <- kNN(x = edge_coords_um[[i]][, c("x", "y")] |> as.matrix(),
+               query = use_xyz[[i]][, c("x", "y")] |> as.matrix(),
+               k = 1)
+  data.frame(
+    barcode = use_xyz[[i]]$barcode,
+    dist_edge_2d = knn_res$dist[, 1, drop = TRUE]
+  )
+}
+
+# Add distance to seurat objects
+seu[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(edge_dist_3d, by = 'barcode') %>%
+  left_join(edge_dist_2d, by = 'barcode') %>%
+  column_to_rownames('barcode')
+seu_bc[[]] %<>% 
+  rownames_to_column('barcode') %>%
+  left_join(edge_dist_3d, by = 'barcode') %>%
+  left_join(edge_dist_2d, by = 'barcode') %>%
+  column_to_rownames('barcode')
+```
+
+
+
+## Tissue edge plots
+
+Plot annotated tissue edges on top of the spatial coordinates for each sample. This will allow us to visually inspect the quality of the edge annotation and the transformation applied to the coordinates.
+```{r edge-plots, fig.width=12, fig.asp=1.3}
+edge_plots <- foreach(i = sample_alias_to_sampleID$sample_alias) %do% {
+  if(i %in% names(edge_coords)) {
+  boundary_coords <- edge_coords[[i]]
+  sample_id <- sample_alias_to_sampleID %>% 
+    filter(sample_alias == i) %>% 
+    pull(sampleID)
+  
+  res <- GetCoordinates(seu) %>% 
+    filter(sampleID == sample_id) %>% 
+    ggplot(
+      aes(x = pxl_col_in_fullres_transformed, y = pxl_row_in_fullres_transformed),
+    ) +
+    geom_point(size = 0.1, alpha = 0.5) +
+    geom_point(data = boundary_coords, 
+               aes(x = x, y = y),
+               color = 'red') +
+    
+    theme_minimal() +
+    labs(
+      x = 'x',
+      y = 'y',
+      title = i)
+  
+  
+   # we need to reverse the y-axis because the coordinates are in image space, where (0,0) is the top-left corner and y increases downwards. In ggplot2, the default is Cartesian space, where (0,0) is the bottom-left corner and y increases upwards. By adding scale_y_reverse(), we flip the y-axis so that it matches the image coordinate system, allowing the points to be plotted in their correct spatial locations relative to the tissue edge.
+   res <- res + scale_y_reverse()
+   
+   return(res)
+  } else {
+    return(NULL)
+  }
+}
+edge_plots <- compact(edge_plots)
+patchwork::wrap_plots(edge_plots, ncol = 5)
+```
+
+
+## 3D visualization of physical distances
+
+### Center
+```{r physical-distances-center}
+fig <- plot_ly(
+  seu[[]] , 
+  x = ~x, y = ~y, z = ~z,
+  color = ~dist_center, 
+  colors = 'YlOrRd',
+  # alpha_stroke = 0,
+  marker = list(
+    opacity = 0.2,
+    size = 2
+  )
+)
+
+fig %>% 
+  layout(
+    title = 'Distance the center',
+    legend= list(itemsizing='constant'),
+    scene = list(
+      xaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      yaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      zaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = '')
+    )
+    ) # keep the legend makers the same size
+```
+
+### Edge (3D)
+```{r physical-distances-edge-3d}
+fig <- plot_ly(
+  seu[[]] , 
+  x = ~x, y = ~y, z = ~z,
+  color = ~dist_edge_3d, 
+  colors = 'YlOrRd',
+  # alpha_stroke = 0,
+  marker = list(
+    opacity = 0.2,
+    size = 2
+  )
+)
+
+fig %>% 
+  layout(
+    title = 'Distance (3D) to the closest edge point',
+    legend= list(itemsizing='constant'),
+    scene = list(
+      xaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      yaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      zaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = '')
+    )
+    ) # keep the legend makers the same size
+```
+
+### Edge (2dD)
+```{r physical-distances-edge-2d}
+fig <- plot_ly(
+  seu[[]] , 
+  x = ~x, y = ~y, z = ~z,
+  color = ~dist_edge_2d, 
+  colors = 'YlOrRd',
+  # alpha_stroke = 0,
+  marker = list(
+    opacity = 0.2,
+    size = 2
+  )
+)
+
+fig %>% 
+  layout(
+    title = 'Distance (2D) to the closest edge point',
+    legend= list(itemsizing='constant'),
+    scene = list(
+      xaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      yaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = ''),
+      zaxis = list(showgrid = FALSE, zeroline = FALSE,
+                   showticklabels=FALSE, title = '')
+    )
+    ) # keep the legend makers the same size
+```
+
+
+
+
+## BC goups
+### Compare distances
+```{r bc-groups-physical-distances-table}
+res_tab <- tableby(
+  bc_group_cluster ~ dist_center + dist_edge_3d + dist_edge_2d, 
+  data = seu_bc[[]],
+  control = tableby.control(total=FALSE)
+)
+summary(
+  res_tab, pfootnote=TRUE
+)
+```
+
+### Violin plot distances
+```{r bc-groups-physical-distances-violin_conf}
+xvar <- 'bc_group_cluster'
+use_palette <- bc_group_cluster_palette
+use_data <- seu_bc[[]] %>% 
+  filter(!is.na(.[[xvar]]))
+use_comparisons <- combn(levels(seu_bc[[]][,xvar]), 2, simplify = FALSE)
+```
+
+#### Center
+```{r bc-groups-physical-distances-violin-center, fig.asp = 0.718}
+ggviolin(use_data, 
+          x = xvar, y = "dist_center",
+          color = xvar, palette = use_palette,
+         add = "boxplot", add.params = list(fill = "white")) + 
+  stat_compare_means(comparisons = use_comparisons, label = "p.signif") +
+  labs(
+    title = 'Distance to the center',
+    x = '',
+    y = 'Distance (microns)'
+  ) +
+  theme(legend.position = "none")
+```
+
+#### Edge
+```{r bc-groups-physical-distances-violin-edge3d, fig.asp = 0.718}
+ggviolin(use_data, 
+          x = xvar, y = "dist_edge_3d",
+          color = xvar, palette = use_palette,
+         add = "boxplot", add.params = list(fill = "white")) + 
+  stat_compare_means(comparisons = use_comparisons, label = "p.signif") +
+  labs(
+    title = 'Distance to the edge (3D)',
+    x = '',
+    y = 'Distance (microns)',
+    caption = 'Distance calculated to the closest edge point'
+  ) +
+  theme(legend.position = "none")
+```
+

@@ -1,0 +1,180 @@
+---
+title: Analysis of FB markers in CD90.1-positive tumor cells sorted from a KPC C57BL/6J primary tumor
+author: Francesc Castro-Giner
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_path: ./data/rnaseq/kpc_te3-bulk/se.rds
+---
+
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', fig.width = 3.5, fig.asp = 0.618, dpi = 600, dev = c("png", "pdf"), fig.showtext = FALSE, engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(ggbeeswarm)
+library(SummarizedExperiment)
+library(edgeR)
+library(scater)
+library(scran)
+require(ggrepel)
+require(see)
+```
+
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/dge_wrappers.r')
+downsample_counts <- function(count_matrix, samples_to_downsample, target_size) {
+  downsampled_matrix <- count_matrix
+  
+  for (sample in samples_to_downsample) {
+    counts <- count_matrix[, sample]
+    total_counts <- sum(counts)
+    
+    if (total_counts <= target_size) {
+      message(paste("Sample", sample, "already has fewer reads than target size."))
+      next
+    }
+    
+    # Create a vector of gene names repeated by their counts
+    gene_pool <- rep(rownames(count_matrix), counts)
+    
+    # Randomly sample from the gene pool
+    sampled_genes <- sample(gene_pool, size = target_size, replace = FALSE)
+    
+    # Count occurrences of each gene in the sampled set
+    downsampled_counts <- table(sampled_genes)
+    
+    # Replace original counts with downsampled counts
+    downsampled_matrix[, sample] <- 0
+    downsampled_matrix[names(downsampled_counts), sample] <- as.integer(downsampled_counts)
+  }
+  
+  return(downsampled_matrix)
+}
+```
+
+Generate a list of FB markers
+```{r fb-mk}
+fb_mk_hs <- c('ACTA2',
+'PDGFRA',
+'PDGFRB',
+'FN1',
+'FAP',
+'COL1A1',
+'COL1A2',
+'COL3A1',
+'DCN',
+'SPARC'
+)
+
+fb_mk <- babelgene::orthologs(fb_mk_hs, species = 'mouse')$symbol
+```
+
+
+## FB markers in KPC TE3 bulk RNA-seq
+```{r kpc-bulk-fb-mk-conf}
+# Load KPC TE3 data
+kpc_te3 <- readRDS(params$se_path)
+
+# Normalization
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(kpc_te3, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+kpc_te3$size_factor <- (norm_factors * lib_size)
+kpc_te3 <- logNormCounts(kpc_te3, size.factors =kpc_te3$size_factor)
+kpc_te3 <- logNormCounts(kpc_te3, size.factors =kpc_te3$size_factor, log = FALSE)
+assay(kpc_te3, 'cpm') <- edgeR::cpm(assay(kpc_te3, 'normcounts'))
+assay(kpc_te3, 'logcpm') <- edgeR::cpm(assay(kpc_te3, 'normcounts'), log = TRUE)
+
+```
+
+
+```{r kpc-bulk-fb-mk-density}
+kpc_te3_counts <- assay(kpc_te3, 'logcounts')
+rownames(kpc_te3_counts) <- make.names(rowData(kpc_te3)$gene_name, unique = TRUE)
+
+# Convert kpc_te3_counts to a long data.frame
+use_data <- kpc_te3_counts |> 
+  as.data.frame() |> 
+  rownames_to_column('gene') |> 
+  pivot_longer(cols = -gene, names_to = 'sample_alias', values_to = 'logcounts') |> 
+  mutate(fb_mk = gene %in% fb_mk)
+# Generate density plots, facet by sample, showing density of logcounts and placing fb_mk genes with a vertical line
+use_data |> 
+  filter(logcounts > 0) |> 
+  ggplot(aes(x = sample_alias, y = logcounts)) +
+    geom_violinhalf(fill = "gray60", 
+              alpha = 0.2, 
+              scale = "width", 
+              width = 0.6, linewidth = linewidth_default/2,
+              flip = TRUE) +
+  geom_point(data = use_data |> 
+                      filter(fb_mk == TRUE), 
+                   color = "red") +
+  geom_text_repel( data = use_data |>
+                     filter(fb_mk == TRUE),
+                   aes(label = gene),
+                   force        = 0.5,
+    nudge_x      = 0.2,
+    direction    = "y",
+    hjust        = 0,
+    segment.size = 0.1,
+                   size = geom_text_size,
+    inflect = TRUE
+  ) +
+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_x_discrete(expand = expansion(mult = c(0.3, 0.3))) +
+  labs(title = 'Density of logcounts for fibroblast markers in KPC TE3 bulk RNA-seq',
+       x = '',
+       y = 'Logcounts')
+```
+
+
+```{r kpc-bulk-fb-mk-density-fb-expres-table}
+use_data %>% 
+  filter(fb_mk == TRUE) %>% 
+  select(-fb_mk) %>% 
+  mutate(logcounts = round(logcounts, 3)) %>%
+  datatable(., 
+          rownames = FALSE, 
+          filter = 'top', 
+          caption = 'Expression level of FB markers',
+          extensions = 'Buttons', 
+          options = list(
+            dom = 'Blfrtip',
+            buttons = c('csv', 'excel')
+          ))
+  
+```

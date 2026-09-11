@@ -1,0 +1,436 @@
+---
+title: "Analysis of PDAC-3 xenograft samples"
+subtitle: "Differential gene expression between CTC types"
+author: "Francesc Castro-Giner"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_path: ./data/rnaseq/pdac3-ctc/se_qc_hs.rds
+  output_dir: ./output/rnaseq/pdac3-ctc/differential_expression_edger/sample_type
+  min_counts: 5
+  min_present_prop: 0.40
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2023.1.Hs
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+```
+
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+
+## Configure analyses
+
+### Data wrangling
+Load SE object and remove outliers
+```{r dw-load-se}
+se <- readRDS(params$se_path)
+```
+
+Modify sample annotation
+```{r dw-coldata}
+colData(se) %<>% data.frame %>%
+  mutate(
+    sample_type_grouped = sample_type,
+    sample_type_grouped = ifelse(sample_type == 'ctc_cluster_heterotypic_dn', 
+                                 'ctc_cluster_heterotypic', 
+                                 sample_type_grouped),
+    sample_type_grouped_4l = ifelse(sample_type == 'ctc_cluster_wbc', 
+                                 'ctc_cluster_heterotypic', 
+                                 sample_type_grouped),
+    sample_type_grouped_4l = ifelse(sample_type == 'cto_heterotypic', 
+                                 'cto', 
+                                 sample_type_grouped),
+    sample_type_grouped_3l = ifelse(sample_type_grouped == 'ctc_cluster_heterotypic', 
+                                 'ctc_cluster', 
+                                 sample_type_grouped),
+    sample_type_grouped_3l = ifelse(sample_type_grouped == 'cto_heterotypic', 
+                                 'cto', 
+                                 sample_type_grouped)
+  ) %>%
+  DataFrame
+```
+
+Filtering out low-abundance features. Keeping those features with at least 10 counts in at least 50% of samples of the smallest group.
+```{r dw-subset-feature-abundance}
+use_rows <- filterByExpr(se, group=se$sample_type, min.count = 10, min.total.count = 15, min.prop = 0.5)
+se <- se[use_rows,]
+```
+
+TMM normalization
+```{r dw-tmm}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+```
+
+CPM calculation
+```{r dw-cpm}
+assay(se, 'cpm') <- edgeR::cpm(assay(se, 'normcounts'))
+assay(se, 'logcpm') <- edgeR::cpm(assay(se, 'normcounts'), log = TRUE)
+```
+
+
+### Define of comparisons
+
+#### Process data
+```{r conf-comparisons}
+x <- colData(se) %>% data.frame
+
+# Define groups
+ctc_single_samples <- x %>% 
+  filter(sample_type == 'ctc_single_pool') %>% 
+  pull(sample_alias)
+ctc_cluster_samples <- x %>% 
+  filter(sample_type == 'ctc_cluster') %>% 
+  pull(sample_alias)
+ctc_cluster_comb_samples <- x %>% 
+  filter(grepl('ctc_cluster', sample_type)) %>% 
+  pull(sample_alias)
+ctc_cluster_hetero_samples <- x %>% 
+  filter(sample_type %in% c('ctc_cluster_heterotypic', 'ctc_cluster_heterotypic_dn', 'ctc_cluster_wbc')) %>% 
+  pull(sample_alias)
+cto_samples <- x %>% 
+  filter(sample_type %in% c('cto', 'cto_heterotypic')) %>% 
+  pull(sample_alias)
+```
+
+Define initial comparisons without batch correction
+```{r conf-comparisons-unbathced}
+comp_list <- list(
+  `CTO-over-S` = list(
+    CTO = cto_samples,
+    Single = ctc_single_samples
+  ),
+  `CTO-over-Cl` = list(
+    CTO = cto_samples,
+    Cluster = ctc_cluster_comb_samples
+  )
+)
+
+comp_list_description <- data.frame(
+  comparison = names(comp_list),
+  comparison_long = c(
+    "CTO-over-Single",
+    "CTO-over-Cluster"
+  )
+)
+```
+
+Add comparisons with batch correction. Only using batch levels with samples in both categories and comparisons with more than 2 levels of the batch variable
+```{r conf-comparisons-bathced}
+batch_var <- 'mouse_id'
+batch_levels <- unique(x[,batch_var])
+for(cn in names(comp_list)) {
+  i <- comp_list[[cn]]
+  sample_batch_levels <- x %>% 
+    filter(sample_alias %in% i[[1]]) %>% 
+    pull(batch_var) %>% 
+    unique
+  ctrl_batch_levels <- x %>% 
+    filter(sample_alias %in% i[[2]]) %>% 
+    pull(batch_var) %>% 
+    unique
+  use_batch_levels <- intersect(sample_batch_levels, ctrl_batch_levels)
+  sample_samples <-  x %>% 
+    filter(sample_alias %in% i[[1]]) %>% 
+    filter(mouse_id %in% use_batch_levels) %>% 
+    pull(sample_alias)
+  ctrl_samples <-  x %>% 
+    filter(sample_alias %in% i[[2]]) %>% 
+    filter(mouse_id %in% use_batch_levels) %>% 
+    pull(sample_alias)
+  if(length(use_batch_levels) > 1 & 
+      length(sample_samples) > 0 & 
+      length(ctrl_samples) > 0) {
+    # Add comparison to list of comparison
+    res <- list(
+      sample = sample_samples,
+      ctrl = ctrl_samples,
+      batch = batch_var
+    )
+    names(res)[1:2] <- names(i)[1:2]
+    comp_list[[paste0(cn, '-', batch_var)]] <- res
+    # Add comparison long name description
+    new_desc <- comp_list_description %>% 
+      filter(comparison == cn) %>%
+      mutate(comparison_long = paste(comparison_long, 'batch', batch_var),
+             comparison = paste0(cn, '-', batch_var))
+    comp_list_description <- rbind(comp_list_description, new_desc)
+  }  
+}
+```
+
+
+
+#### Table of comparisons
+
+We filter comparisons with n < 3 samples in each group
+```{r table-comparisons}
+i = names(comp_list)[1]
+comp_df <- foreach(i = names(comp_list), .combine = rbind) %do% {
+  icomp <- comp_list[[i]]
+  data.frame(
+    comparison = i,
+    `Sample Group (n)` =  length(icomp[[1]]),
+    `Reference Group (n)` = length(icomp[[2]]),
+    check.names = FALSE
+  )
+}
+
+# filter comparisons were we have at least 3 samples in each group
+comp_df %<>% 
+  mutate(Evaluated = `Sample Group (n)` >= 3 & `Reference Group (n)` >= 3)
+kepp_comp <- comp_df %>% filter(Evaluated) %>% pull(comparison)
+comp_list <- comp_list[kepp_comp]
+
+# Add long names
+comp_df <- comp_df %>% left_join(comp_list_description) %>% 
+  mutate(comparison = comparison_long) %>%
+  dplyr::select(-comparison_long)
+
+comp_df %>%
+  datatable(., 
+            rownames = FALSE, 
+            filter = 'top', 
+            caption = 'List of comparisons for differential expression. Comparisons with n < 3 samples in each group won\'t be evaluated',
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c('csv', 'excel')
+            ))
+
+```
+
+## Data generation
+
+### Run differential expression analysis
+Get Ensembl gene info
+```{r de-ensembl, eval = FALSE}
+ensembl <-  biomaRt::useEnsembl(biomart="genes", dataset="hsapiens_gene_ensembl",
+                                mirror = 'useast')
+gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description'),
+                              filters = 'external_gene_name',
+                              values = rowData(se)$gene_name, mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+
+gene_desc <- gene_desc[!duplicated(gene_desc$gene_name),]
+saveRDS(gene_desc, file = file.path(dirname(params$se_path), 'ensembl_gene_desc.rds'))
+```
+
+```{r de-ensembl-load, eval = FALSE}
+gene_desc <- readRDS(file = file.path(dirname(params$se_path), 'ensembl_gene_desc.rds'))
+```
+
+Run differential expression analysis using EdgeR QLF
+```{r edgeR-QLF-run, eval = FALSE}
+use_comp <-  comp_list[[1]]
+dge_list <- foreach(use_comp = comp_list) %do%{
+  se_cols <- se$sample_alias %in% unlist(use_comp)
+  use_se <- se[,se_cols]
+  use_se$group <- ifelse(
+    use_se$sample_alias %in% use_comp[[1]],
+    names(use_comp)[1],
+    names(use_comp)[2]
+  )
+  
+  if(is.null(use_comp$batch)) {
+    dge <- edgeR_dge(
+      use_se,
+      # Design configuration for differential expression
+      group_var =  'group',
+      group_sample = names(use_comp)[1],
+      group_ref = names(use_comp)[2],
+      design_formula = "~ group",
+      coef = 'last',
+      # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+      assay_to_DGEList = 'counts',
+      assay_to_row_filter = "counts",
+      # Feature filtering parameters
+      use_filterByExpr = TRUE,
+      min_counts = params$min_counts,
+      min_present_prop = params$min_present_prop,
+      # EdgeR workflow configuration
+      run_calcNormFactors = 'TMM',
+      estimateDisp_robust = TRUE,
+      estimateDisp_trend.method = "locfit",
+      glm_approach = "QLF",
+      # Output configuration
+      adjust_method = 'BH'
+      )
+    } else {
+      design_formula = paste0("~ ", use_comp$batch," + group")
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = use_comp$batch,
+        design_formula = design_formula,
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+        )
+    }
+  
+  # Add gene description
+  use_res <- dge$results %>%  left_join(., gene_desc, relationship = "many-to-many")
+  dge$results <- use_res %>% 
+    filter(!duplicated(feature)) %>% 
+    mutate(rownames = feature) %>% 
+    column_to_rownames('rownames')
+  
+   return(dge)
+}
+
+names(dge_list) <- names(comp_list)
+
+# Save objects
+saveRDS(dge_list, file = file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+
+```
+
+### Run functional enrichment
+```{r gse-run, eval = FALSE}
+dge_list <- readRDS(file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+dge <-  dge_list[[2]]
+
+gse_list <- foreach(dge = dge_list) %do%{
+  gse_res <- gse_omnibus(
+    feature_names = dge$results$gene_name,
+    p = dge$results$FDR,
+    fc = dge$results$logFC,
+    fc_thrs = 0.5,
+    gmt_files = gmt_files_symbols,
+    
+    run_enricher = FALSE,
+    run_enrichGO = FALSE,
+    run_enrichKEGG = FALSE,
+    run_enrichReactome = FALSE,
+    
+    run_GSEA = TRUE,
+    run_gseGO = TRUE,
+    run_gseKEGG = FALSE,
+    run_gseReactome = FALSE,
+    
+    go_ontologies = c('BP', 'MF'),
+    go_simplify_p = 0.05,
+    args_gse = list(minGSSize = 10, maxGSSize = 250, 
+                    pvalueCutoff = 1, 
+                    BPPARAM = BiocParallel::MulticoreParam(1))
+    )
+  
+   return(gse_res)
+
+}
+names(gse_list) <- names(dge_list)
+
+# Save objects
+saveRDS(gse_list, file = file.path(params$output_dir,'gse_omnibus-edgeR_QLF.rds'))
+```
+
+
+### Load data
+```{r dge-gse-load}
+dge_list <- readRDS(file = file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+gse_list <- readRDS(file = file.path(params$output_dir, 'gse_omnibus-edgeR_QLF.rds'))
+```
+
+
